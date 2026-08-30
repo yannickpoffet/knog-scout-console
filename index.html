@@ -3,6 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
 <meta name="description" content="Arm and disarm a Knog Scout over Web Bluetooth.">
 <style>:root{color-scheme:light dark}body{margin:0}img{max-width:100%}</style>
 <title>Scout Alarm Console</title>
@@ -235,6 +237,7 @@
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
+  var BUILD = "21:09";
   var ARM = 0x01, DISARM = 0x02;
   // The Scout hangs up ~5.7s after connect if discovery has not finished, so
   // every millisecond spent settling is a millisecond discovery does not get.
@@ -612,6 +615,7 @@
     var ua = navigator.userAgent;
     var chrome = (ua.match(/Chrome\/([\d.]+)/) || [])[1];
     var android = (ua.match(/Android ([\d.]+)/) || [])[1];
+    log("build " + BUILD);
     log("browser: Chrome " + (chrome || "?") + " on Android " + (android || "?"));
     log("secure context: " + window.isSecureContext + " | framed: " + framed() +
         " | api: " + (navigator.bluetooth ? "yes" : "no"));
