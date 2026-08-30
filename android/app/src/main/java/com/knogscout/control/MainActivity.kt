@@ -1,5 +1,6 @@
 package com.knogscout.control
 
+import android.Manifest
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -11,8 +12,10 @@ import android.bluetooth.BluetoothManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -64,30 +67,14 @@ class MainActivity : Activity() {
     private var alarmChar: BluetoothGattCharacteristic? = null
     private var discoveryTries = 0
     private var wantConnection = false
-    private var useRefresh = true
     private var cycle = 0
 
-    /** One point in the search space. Discovery on this device is intermittent
-     *  and no single theory has held, so the app sweeps the combinations and
-     *  reports which one actually worked. */
-    private data class Combo(
-        val auto: Boolean, val refresh: Boolean, val delay: Long, val prio: Int
-    ) {
-        fun label() = "auto=$auto refresh=$refresh delay=${delay}ms " +
-            "prio=" + if (prio == BluetoothGatt.CONNECTION_PRIORITY_HIGH) "HIGH" else "BAL"
-    }
-
-    // The sweep showed the same combination both succeeding and failing, so the
-    // parameters do not decide it. What decides it is whether Android serves its
-    // cache (<1s, 8 services) or does a real discovery (~5s, 0 services) - and
-    // the Scout refuses real discoveries. So: never refresh (that discards the
-    // good cache), and just retry until a cache-backed discovery lands.
-    private val combos: List<Combo> = listOf(
-        Combo(auto = false, refresh = false, delay = 1600L,
-              prio = BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
-    )
-
-    private fun currentCombo(): Combo = combos[(cycle - 1).coerceAtLeast(0) % combos.size]
+    // Settled empirically: a direct connect, ~1.6s settle, balanced priority,
+    // and never refresh() - refreshing discards Android's cached table, which
+    // is the only thing the Scout will serve.
+    private val autoConnect = false
+    private val discoveryDelay = 1600L
+    private val priority = BluetoothGatt.CONNECTION_PRIORITY_BALANCED
 
     private val queue = ArrayDeque<Triple<String, () -> Boolean, Boolean>>()
     private var busy = false
@@ -157,14 +144,6 @@ class MainActivity : Activity() {
             }
         }
 
-        val refreshBtn = Button(this).apply {
-            text = "allow refresh() : YES"
-            setOnClickListener {
-                useRefresh = !useRefresh
-                text = "allow refresh() : " + if (useRefresh) "YES" else "NO"
-            }
-        }
-
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(armBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -186,7 +165,6 @@ class MainActivity : Activity() {
         root.addView(row)
         val tools = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(refreshBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(copyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
         root.addView(tools)
@@ -194,6 +172,13 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
+
+        if (Build.VERSION.SDK_INT >= 31 &&
+            checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
+                PackageManager.PERMISSION_GRANTED) {
+            log("requesting Bluetooth permission…")
+            requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1)
+        }
 
         val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
         if (adapter == null || !adapter.isEnabled) {
@@ -252,10 +237,9 @@ class MainActivity : Activity() {
     private fun beginCycle() {
         val d = device ?: run { log("no paired Scout"); return }
         discoveryTries = 0
-        val c = currentCombo()
-        log("--- attempt $cycle/$MAX_CYCLES : ${c.label()} ---")
+        log("--- attempt $cycle of $MAX_CYCLES ---")
         setState("TRYING", "attempt $cycle of $MAX_CYCLES", "#E0A63C")
-        gatt = d.connectGatt(this, c.auto, callback, BluetoothDevice.TRANSPORT_LE)
+        gatt = d.connectGatt(this, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
     }
 
     /** Discovery failed on this link: tear it down and try a brand new one. */
@@ -292,17 +276,6 @@ class MainActivity : Activity() {
         }
         setState("OFFLINE", "not connected", "#7C8A8C")
         log("disconnected on request")
-    }
-
-    /** The hidden call that clears Android's cached attribute table. */
-    private fun refresh(g: BluetoothGatt): Boolean = try {
-        val m = g.javaClass.getMethod("refresh")
-        val ok = m.invoke(g) as? Boolean ?: false
-        log(if (ok) "gatt.refresh() ok - cache cleared" else "gatt.refresh() returned false")
-        ok
-    } catch (e: Exception) {
-        log("gatt.refresh() unavailable (${e.javaClass.simpleName}) - continuing")
-        false
     }
 
     private val keepAlive = object : Runnable {
@@ -364,15 +337,13 @@ class MainActivity : Activity() {
             if (newState == BluetoothGatt.STATE_CONNECTED) {
                 log("connected (status $status)")
                 setState("LINKED", "clearing cache…", "#4FBE7C")
-                val c = currentCombo()
-                g.requestConnectionPriority(c.prio)
+                g.requestConnectionPriority(priority)
                 log("bond=${bondName(g.device.bondState)}")
-                if (c.refresh && useRefresh) refresh(g)
                 discoveryTries = 1
                 ui.postDelayed({
                     log("discovering services…")
                     g.discoverServices()
-                }, c.delay)
+                }, discoveryDelay)
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                 log("link dropped (status $status)")
                 val wasReady = alarmChar != null

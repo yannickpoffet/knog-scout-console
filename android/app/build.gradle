@@ -10,11 +10,12 @@ android {
     defaultConfig {
         applicationId "com.knogscout.control"
         minSdk 21
-        // Deliberately 28: keeps BluetoothGatt.refresh() reachable under
-        // Android's non-SDK interface rules. Sideload only.
-        targetSdk 28
-        versionCode 1
-        versionName "1.0"
+        // 34: refresh() is never called any more (it discards the good cache),
+        // so nothing needs the non-SDK interface exemption that targetSdk 28
+        // bought - and Play Protect stops blocking the install.
+        targetSdk 34
+        versionCode 2
+        versionName "1.1"
     }
 
     compileOptions {
