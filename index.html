@@ -223,8 +223,11 @@
   <p class="note" id="note">
     Arming writes <code>01</code> to the Scout's Control Point characteristic and
     disarming writes <code>02</code>; state comes from Alarm Active notifications.
-    A web page cannot list your phone&rsquo;s paired devices &mdash; Web Bluetooth
-    only ever grants the one device you pick in the browser&rsquo;s chooser.
+    Arming writes <code>01</code> to Control Point, disarming writes <code>02</code>;
+    state comes from Alarm Active notifications.
+    <strong>If Connect fails:</strong> open nRF Connect, connect to the Scout, and
+    tap <kbd>Refresh services</kbd> <em>while connected</em> &mdash; that clears
+    Android&rsquo;s stale service cache. Then come back and Connect.
     Chrome or Edge on Android only; Firefox and iOS have no Web Bluetooth.
     Unofficial tool, not affiliated with Knog.
   </p>
@@ -237,7 +240,7 @@
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
-  var BUILD = "21:56";
+  var BUILD = "22:15";
   var ARM = 0x01, DISARM = 0x02;
   // The Scout hangs up ~5.7s after connect if discovery has not finished, so
   // every millisecond spent settling is a millisecond discovery does not get.
@@ -409,19 +412,20 @@
   function advise() {
     log("", "err");
     log("Still failing after " + SETUP_TRIES + " attempts. In order:", "err");
-    log("LIKELY CAUSE: the Scout keeps only one pairing at a time. If it has", "err");
-    log("since been paired to another host - a laptop, another phone - this", "err");
-    log("phone\u2019s key is stale. Android still lists it as paired, the Scout", "err");
-    log("no longer accepts it, and discovery dies part-way.", "err");
+    log("CAUSE: Android is serving a stale, empty service table for the", "err");
+    log("Scout. The Scout uses Robust Caching and marks clients out of sync", "err");
+    log("when its attribute table changes; Android does not recover, caches", "err");
+    log("nothing, and hands every app - including this page - zero services.", "err");
     log("", "err");
-    log("FIX, in order:", "err");
-    log("  1. Settings > Bluetooth > Knog Scout > Forget", "err");
-    log("  2. Pair again (press the Scout\u2019s button so it advertises)", "err");
-    log("  3. Reload this page and Connect", "err");
-    log("Then do not pair it to anything else - that would evict this phone.", "err");
+    log("FIX (verified to work):", "err");
+    log("  1. Open nRF Connect and CONNECT to the Knog Scout", "err");
+    log("  2. WHILE STILL CONNECTED, tap the menu and choose", "err");
+    log("     \u201cRefresh services\u201d / refresh device cache", "err");
+    log("  3. Disconnect, come back here, and tap Connect", "err");
     log("", "err");
-    log("Also check range: this needs a solid signal. Hold the phone within", "err");
-    log("arm\u2019s reach of the Scout - discovery drops packets on a weak link.", "err");
+    log("It must be done while connected - on a closed connection the", "err");
+    log("refresh silently fails. Web Bluetooth has no equivalent call, so", "err");
+    log("this has to be done from nRF Connect.", "err");
     $("reloadRow").classList.remove("hide");
   }
 
