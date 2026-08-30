@@ -241,7 +241,7 @@
   // Keep it minimal, and drop it entirely once an attempt has failed.
   var SETTLE_MS = 250;
   var BUDGET_MS = 5700;
-  var SETUP_TRIES = 5;      // whole connect+discovery attempts
+  var SETUP_TRIES = 3;      // whole connect+discovery attempts
   var READ_MS = 4000;       // reads die fast; a hung one jams Android's queue
   var jammed = false;       // a timed-out read blocks every later operation
 
@@ -364,8 +364,8 @@
     $("raw").textContent = "not connected";
     log("!! link dropped by the device after " + held + "s, during: " + currentStep, "err");
     if (currentStep !== "ready" && held > 0 && held < 8) {
-      log("   dropped mid-setup on the ~5s supervision timeout: the Scout " +
-          "answered nothing at all", "err");
+      log("   discovery did not finish inside the ~5.7s the Scout allows " +
+          "before it hangs up", "err");
     }
     cpChar = null; alarmChar = null;
 
@@ -381,6 +381,7 @@
 
   async function gattConnect(dev, attempts) {
     var lastErr = null;
+    connectedAt = 0;
     for (var i = 1; i <= attempts; i++) {
       try {
         var t0 = performance.now();
@@ -405,11 +406,15 @@
   function advise() {
     log("", "err");
     log("Still failing after " + SETUP_TRIES + " attempts. In order:", "err");
-    log("Discovery is not finishing inside the ~5.7s the Scout allows.", "err");
-    log("Android is doing a cold, full discovery of a large attribute table.", "err");
-    log("To warm its cache, connect once from another BLE app (nRF Connect)", "err");
-    log("or from Android's Bluetooth settings, then come back here - a cached", "err");
-    log("discovery returns in milliseconds and fits the window easily.", "err");
+    log("The Scout wants an encrypted link and hangs up after ~5.7s if it", "err");
+    log("does not get one. Android only starts encryption when it reads a", "err");
+    log("characteristic - and a cold discovery never finishes in time to", "err");
+    log("reach one. When Android's cache is warm, discovery takes ~800ms,", "err");
+    log("the read happens, encryption fires, and everything works.", "err");
+    log("", "err");
+    log("FIX: open nRF Connect, connect to the Scout, let it list all the", "err");
+    log("services, then disconnect. That warms Android's cache for this", "err");
+    log("device. Come back here and Connect - discovery will be instant.", "err");
     $("reloadRow").classList.remove("hide");
   }
 
@@ -442,6 +447,13 @@
         }
         if (dev.gatt && dev.gatt.connected) {
           try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
+        }
+        if (currentStep === "get Battery Service" && i >= 2) {
+          log("", "err");
+          log("Two cold discoveries in a row were cut off at the same point.", "err");
+          log("More attempts will not change this - see below.", "err");
+          advise();
+          return;
         }
         if (i < SETUP_TRIES) {
           // give discovery the entire window from here on
