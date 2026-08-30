@@ -165,6 +165,7 @@
     min-height: 32px; padding: 0 12px; font-size: 11px; letter-spacing: .1em;
     border-radius: 8px; background: var(--surface-2);
   }
+  .pickrow { display: flex; justify-content: center; margin-top: -6px; }
   .hide { display: none !important; }
 </style>
 </head>
@@ -188,6 +189,10 @@
     <button class="primary wide" id="btnConnect">Connect</button>
     <button id="btnArm" disabled>Arm</button>
     <button id="btnDisarm" disabled>Disarm</button>
+  </div>
+
+  <div class="pickrow hide" id="pickRow">
+    <button id="btnPick" class="mini">Pick a different device</button>
   </div>
 
   <div class="card hide" id="knownCard">
@@ -227,7 +232,7 @@
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
   var ARM = 0x01, DISARM = 0x02;
-  var SETTLE_MS = 900;      // let encryption finish before discovery
+  var SETTLE_MS = 1500;     // let encryption finish before discovery
   var SETUP_TRIES = 5;      // whole connect+discovery attempts
 
   var STATES = {
@@ -242,6 +247,7 @@
   var currentStep = "idle";
   var connectedAt = 0;
   var autoRetry = true;
+  var reconnectTries = 0;
 
   function framed() {
     try { return window.self !== window.top; } catch (e) { return true; }
@@ -331,6 +337,7 @@
   }
 
   function onDisconnected() {
+    var wasReady = (currentStep === "ready");
     var held = connectedAt ? Math.round((performance.now() - connectedAt) / 100) / 10 : 0;
     setConnected(false);
     $("state").dataset.s = "-";
@@ -342,6 +349,15 @@
           "the Scout does this when it wants an encrypted (bonded) link", "err");
     }
     cpChar = null; alarmChar = null;
+
+    if (wasReady && autoRetry && reconnectTries < 3) {
+      reconnectTries += 1;
+      var wait = 2000 * reconnectTries;
+      log("auto-reconnecting in " + wait + " ms (" + reconnectTries + "/3)");
+      setTimeout(function () {
+        if (device && !(device.gatt && device.gatt.connected)) { attach(device); }
+      }, wait);
+    }
   }
 
   async function gattConnect(dev, attempts) {
@@ -381,6 +397,8 @@
       try {
         await setupOnce(dev);
         if (i > 1) { log("recovered on attempt " + i); }
+        reconnectTries = 0;
+        $("pickRow").classList.remove("hide");
         return;
       } catch (e) {
         setConnected(false);
@@ -475,12 +493,23 @@
         : "Web Bluetooth unavailable in this browser (Chrome/Edge on Android only)", "err");
       return;
     }
+    if (device) {
+      log("reconnecting to " + (device.name || "the known device") + " - no chooser needed");
+      reconnectTries = 0;
+      await attach(device);
+      return;
+    }
+    await pick();
+  }
+
+  async function pick() {
     try {
       log("opening the device chooser…");
       var dev = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: "Knog" }],
         optionalServices: [KNOG_SVC, "battery_service"]
       });
+      $("pickRow").classList.remove("hide");
       await attach(dev);
     } catch (err) {
       log("chooser: " + explain(err), "err");
@@ -541,6 +570,7 @@
   }
 
   $("btnConnect").addEventListener("click", connect);
+  $("btnPick").addEventListener("click", function () { device = null; pick(); });
   $("btnArm").addEventListener("click", function () { write(ARM, "arm"); });
   $("btnDisarm").addEventListener("click", function () { write(DISARM, "disarm"); });
   $("btnCopy").addEventListener("click", function () {
