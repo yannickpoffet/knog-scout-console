@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
 <meta http-equiv="Pragma" content="no-cache">
-<meta name="description" content="Arm and disarm a Knog Scout over Web Bluetooth.">
+<meta name="description" content="Keep a Knog Scout linked over Web Bluetooth.">
 <style>:root{color-scheme:light dark}body{margin:0}img{max-width:100%}</style>
 <title>Scout Alarm Console</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -86,6 +86,7 @@
     background: linear-gradient(180deg, color-mix(in srgb, var(--c) 12%, var(--surface)), var(--surface));
     position: relative; overflow: hidden;
   }
+  .state[data-s="link"] { --c: var(--s-on); }
   .state[data-s="1"] { --c: var(--s-arming); }
   .state[data-s="2"] { --c: var(--s-on); }
   .state[data-s="3"] { --c: var(--s-ring); }
@@ -213,6 +214,10 @@
        a web page cannot show the PIN dialog.</p>
   </div>
 
+  <div class="pickrow hide" id="controlsRow">
+    <button id="btnControls" class="mini">Enable app controls (runs discovery)</button>
+  </div>
+
   <div class="pickrow hide" id="reloadRow">
     <button id="btnReload" class="mini">Reload page (clears Bluetooth state)</button>
   </div>
@@ -243,11 +248,11 @@
   <p class="note" id="note">
     Arming writes <code>01</code> to the Scout's Control Point characteristic and
     disarming writes <code>02</code>; state comes from Alarm Active notifications.
-    Arming writes <code>01</code> to Control Point, disarming writes <code>02</code>;
-    state comes from Alarm Active notifications.
-    <strong>If Connect fails:</strong> open nRF Connect, connect to the Scout, and
-    tap <kbd>Refresh services</kbd> <em>while connected</em> &mdash; that clears
-    Android&rsquo;s stale service cache. Then come back and Connect.
+    <strong>Link-only by default.</strong> Connect opens the Bluetooth link and
+    stops there &mdash; no service discovery, which is the step this Scout breaks.
+    While linked, the button on the Scout arms and disarms it.
+    <em>Enable app controls</em> additionally runs discovery to get Arm/Disarm
+    buttons here; if that fails the link survives and the device button keeps working.
     Chrome or Edge on Android only; Firefox and iOS have no Web Bluetooth.
     Unofficial tool, not affiliated with Knog.
   </p>
@@ -257,24 +262,14 @@
 (function () {
   "use strict";
 
+  var BUILD = "22:47";
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
-  var BUILD = "22:37";
-  var GATT_SVC  = "00001801-0000-1000-8000-00805f9b34fb";  // Generic Attribute
-  var DB_HASH   = "00002b2a-0000-1000-8000-00805f9b34fb";  // Database Hash
+  var GATT_SVC  = "00001801-0000-1000-8000-00805f9b34fb";
   var ARM = 0x01, DISARM = 0x02;
-  // The Scout hangs up ~5.7s after connect if discovery has not finished, so
-  // every millisecond spent settling is a millisecond discovery does not get.
-  // Keep it minimal, and drop it entirely once an attempt has failed.
-  var SETTLE_MS = 250;
-  var BUDGET_MS = 5700;
-  var MAX_TRIES = 25;       // keep trying - the failure is intermittent
-  var keepTrying = false;
-  var attemptNo = 0;
-  var wakeLock = null;
-  var READ_MS = 4000;       // reads die fast; a hung one jams Android's queue
-  var jammed = false;       // a timed-out read blocks every later operation
+  var MAX_TRIES = 30;
+  var READ_MS = 4000;
 
   var STATES = {
     0: ["Off", "disarmed"],
@@ -285,17 +280,15 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var device = null, cpChar = null, alarmChar = null;
-  var currentStep = "idle";
-  var connectedAt = 0;
-  var autoRetry = true;
-  var reconnectTries = 0;
-  var everDisconnected = false;
+  var keepTrying = false, attemptNo = 0, relink = false;
+  var wakeLock = null, controls = false, currentStep = "idle";
 
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function framed() {
     try { return window.self !== window.top; } catch (e) { return true; }
   }
-  function sleep(ms) {
-    return new Promise(function (r) { setTimeout(r, ms); });
+  function isLive() {
+    return !!(device && device.gatt && device.gatt.connected);
   }
 
   function log(msg, cls) {
@@ -307,12 +300,25 @@
     $("log").scrollTop = $("log").scrollHeight;
   }
 
-  function setConnected(yes) {
-    $("conn").textContent = yes ? "Connected" : "Offline";
-    $("conn").dataset.live = yes ? "1" : "0";
-    $("btnArm").disabled = !yes;
-    $("btnDisarm").disabled = !yes;
-    $("btnConnect").textContent = yes ? "Disconnect" : "Connect";
+  function paint() {
+    var live = isLive();
+    $("conn").textContent = keepTrying ? "Connecting…" : (live ? "Linked" : "Offline");
+    $("conn").dataset.live = live ? "1" : "0";
+    $("btnConnect").textContent = keepTrying
+      ? "Stop (attempt " + attemptNo + ")"
+      : (live ? "Disconnect" : "Connect");
+    $("btnArm").disabled = !(live && controls);
+    $("btnDisarm").disabled = !(live && controls);
+    $("controlsRow").classList.toggle("hide", !live || controls);
+    if (live && !controls) {
+      $("state").dataset.s = "link";
+      $("word").textContent = "Linked";
+      $("raw").textContent = "press the button on the Scout to arm or disarm";
+    } else if (!live) {
+      $("state").dataset.s = "-";
+      $("word").textContent = "—";
+      $("raw").textContent = "not connected";
+    }
   }
 
   function renderState(bytes) {
@@ -334,18 +340,14 @@
   function explain(err) {
     var m = String(err && err.message || err);
     var name = err && err.name;
-    if (/permissions policy|disallowed/i.test(m)) {
-      return "running in a frame that blocks Bluetooth; host the page over HTTPS and open it directly";
-    }
+    if (/permissions policy|disallowed/i.test(m)) { return "this frame blocks Bluetooth"; }
     if (/cancelled|User cancelled/i.test(m)) { return "chooser dismissed"; }
-    if (/globally disabled/i.test(m)) { return "Web Bluetooth is turned off in this browser"; }
     if (name === "NotFoundError") {
-      return "not offered/found - turn Location on, close the Knog app, press the Scout's button";
+      return "not found - turn Location on and press the Scout's button";
     }
-    if (name === "SecurityError") { return "browser blocked that characteristic"; }
     if (name === "NetworkError") { return "link lost or refused"; }
-    if (name === "NotSupportedError") { return "GATT rejected the operation (may need an encrypted link)"; }
-    if (name === "InvalidStateError") { return "device not connected"; }
+    if (name === "NotSupportedError") { return "GATT rejected the operation"; }
+    if (name === "SecurityError") { return "blocked by the browser"; }
     return m;
   }
 
@@ -363,239 +365,102 @@
     ]).finally(function () { clearTimeout(timer); });
   }
 
-  function sinceConnect() {
-    if (!connectedAt) { return ""; }
-    var ms = Math.round(performance.now() - connectedAt);
-    return "  [t+" + ms + "ms]";
-  }
-
   async function step(name, fn, ms) {
     currentStep = name;
     var t0 = performance.now();
-    log("→ " + name + sinceConnect());
+    log("→ " + name);
     try {
       var r = await withTimeout(fn(), ms || 12000, name);
-      log("  ✓ " + name + "  (" + Math.round(performance.now() - t0) + " ms)" + sinceConnect());
+      log("  ✓ " + name + "  (" + Math.round(performance.now() - t0) + " ms)");
       return r;
     } catch (e) {
       log("  ✗ " + name + "  (" + Math.round(performance.now() - t0) + " ms)  " +
           (e && e.name ? e.name + ": " : "") + explain(e), "err");
-      if (e && e.name === "TimeoutError") { jammed = true; }
       throw e;
     }
-  }
-
-  function onDisconnected() {
-    var wasReady = (currentStep === "ready");
-    everDisconnected = true;
-    var held = connectedAt ? Math.round((performance.now() - connectedAt) / 100) / 10 : 0;
-    setConnected(false);
-    $("state").dataset.s = "-";
-    $("word").textContent = "—";
-    $("raw").textContent = "not connected";
-    log("!! link dropped by the device after " + held + "s, during: " + currentStep, "err");
-    if (currentStep !== "ready" && held > 0 && held < 8) {
-      log("   link closed during discovery - the Scout is refusing requests " +
-          "(Database Out Of Sync). See the recovery steps on screen.", "err");
-    }
-    cpChar = null; alarmChar = null;
-
-    if (wasReady && autoRetry && reconnectTries < 3) {
-      reconnectTries += 1;
-      var wait = 2000 * reconnectTries;
-      log("auto-reconnecting in " + wait + " ms (" + reconnectTries + "/3)");
-      setTimeout(function () {
-        if (device && !(device.gatt && device.gatt.connected)) { attach(device); }
-      }, wait);
-    }
-  }
-
-  async function gattConnect(dev, attempts) {
-    var lastErr = null;
-    connectedAt = 0;
-    for (var i = 1; i <= attempts; i++) {
-      try {
-        var t0 = performance.now();
-        var srv = await step("GATT connect (attempt " + i + "/" + attempts + ")",
-          function () { return dev.gatt.connect(); }, 15000);
-        if (performance.now() - t0 < 150 && everDisconnected) {
-          log("   ! returned in <150ms - this is a cached handle, not a new link", "err");
-        }
-        return srv;
-      } catch (e) {
-        lastErr = e;
-        if (i < attempts) {
-          var wait = 1200 * i;
-          log("   retrying in " + wait + " ms");
-          await sleep(wait);
-        }
-      }
-    }
-    throw lastErr;
-  }
-
-  function advise() {
-    log("", "err");
-    log("Still failing after " + attemptNo + " attempts.", "err");
-    log("CAUSE: Android is serving a stale, empty service table for the", "err");
-    log("Scout. The Scout uses Robust Caching and marks clients out of sync", "err");
-    log("when its attribute table changes; Android does not recover, caches", "err");
-    log("nothing, and hands every app - including this page - zero services.", "err");
-    log("", "err");
-    log("FIX (verified to work):", "err");
-    log("  1. Open nRF Connect and CONNECT to the Knog Scout", "err");
-    log("  2. WHILE STILL CONNECTED, tap the menu and choose", "err");
-    log("     \u201cRefresh services\u201d / refresh device cache", "err");
-    log("  3. Disconnect, come back here, and tap Connect", "err");
-    log("", "err");
-    log("It must be done while connected - on a closed connection the", "err");
-    log("refresh silently fails. Web Bluetooth has no equivalent call, so", "err");
-    log("this has to be done from nRF Connect.", "err");
-    $("reloadRow").classList.remove("hide");
-  }
-
-  function setTrying(on) {
-    $("btnConnect").textContent = on
-      ? "Stop trying (attempt " + attemptNo + ")"
-      : (device && device.gatt && device.gatt.connected ? "Disconnect" : "Connect");
-    $("conn").textContent = on ? "Trying \u2026" : $("conn").textContent;
   }
 
   async function acquireWake() {
     try {
       if (navigator.wakeLock && !wakeLock) {
         wakeLock = await navigator.wakeLock.request("screen");
-        log("screen kept awake to hold the connection");
       }
     } catch (e) { /* not critical */ }
   }
-
   function releaseWake() {
     try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) { /* ignore */ }
   }
 
-  async function attach(dev) {
+  function onDisconnected() {
+    log("!! link dropped", "err");
+    controls = false;
+    cpChar = null; alarmChar = null;
+    paint();
+    if (relink && device) {
+      log("re-linking…");
+      setTimeout(function () { if (relink && !isLive()) { link(device); } }, 1500);
+    }
+  }
+
+  // Connect only. No getPrimaryService, so no service discovery - which is the
+  // step this device's Robust Caching state breaks. The link alone is enough
+  // for the button on the Scout to arm and disarm.
+  async function link(dev) {
     device = dev;
-    log("device: " + (dev.name || "(no name)") + "  id=" + String(dev.id).slice(0, 12) + "\u2026");
     dev.removeEventListener("gattserverdisconnected", onDisconnected);
     dev.addEventListener("gattserverdisconnected", onDisconnected);
 
     keepTrying = true;
     attemptNo = 0;
-    setTrying(true);
+    relink = true;
 
     while (keepTrying) {
       attemptNo += 1;
-      setTrying(true);
+      paint();
       try {
-        await setupOnce(dev);
+        await step("link (attempt " + attemptNo + ")",
+          function () { return dev.gatt.connect(); }, 20000);
         keepTrying = false;
-        reconnectTries = 0;
-        jammed = false;
-        $("pickRow").classList.remove("hide");
-        $("recoverCard").classList.add("hide");
-        if (attemptNo > 1) { log("connected on attempt " + attemptNo); }
+        paint();
         await acquireWake();
-        setTrying(false);
+        log("LINKED - no service discovery done, so nothing can break it.");
+        log("The button on the Scout now arms and disarms.");
+        $("pickRow").classList.remove("hide");
         return;
       } catch (e) {
-        setConnected(false);
-        log("attempt " + attemptNo + " failed at: " + currentStep, "err");
-        if (dev.gatt && dev.gatt.connected) {
-          try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
-        }
-        SETTLE_MS = 0;
-
-        if (jammed) {
-          log("a read timed out - Android's GATT queue is stuck and only a", "err");
-          log("page reload clears it.", "err");
-          $("reloadRow").classList.remove("hide");
-          keepTrying = false;
-          break;
-        }
-        if (attemptNo === 2) {
-          $("recoverCard").classList.remove("hide");
-          advise();
-        }
         if (attemptNo >= MAX_TRIES) {
           log("gave up after " + attemptNo + " attempts", "err");
           keepTrying = false;
           break;
         }
-        if (!keepTrying) { log("stopped by you"); break; }
-        var w = Math.min(1500 + 400 * attemptNo, 6000);
+        if (!keepTrying) { log("stopped"); break; }
+        var w = Math.min(1200 + 300 * attemptNo, 5000);
         log("retrying in " + w + " ms");
         await sleep(w);
       }
     }
-    setTrying(false);
+    keepTrying = false;
+    paint();
   }
 
-  async function setupOnce(dev) {
-    autoRetry = true;
-    {
-      var server = await gattConnect(dev, 2);
-      connectedAt = performance.now();
-      log("connected; gatt.connected=" + dev.gatt.connected);
-
-      // Android runs the bonding/encryption procedure right after connect.
-      // Firing service discovery into that window is what the Scout ignores,
-      // and an ignored discovery kills the link on the 5s supervision timeout.
-      if (SETTLE_MS > 0) {
-        log("→ settling " + SETTLE_MS + " ms before discovery");
-        await sleep(SETTLE_MS);
-      }
-      if (!dev.gatt.connected) { throw new Error("dropped while settling"); }
-
-      // Robust Caching: when the Scout marks a client change-unaware it
-      // answers Database Out Of Sync to everything except a Database Hash
-      // read, which is what makes the client change-aware again. Doing this
-      // first is the in-page equivalent of nRF Connect's "Refresh services".
+  // Optional: discovery for in-page arm/disarm. This is the fragile part, and
+  // failing it drops the link, so it is opt-in and never runs automatically.
+  async function enableControls() {
+    if (!isLive()) { log("not linked", "err"); return; }
+    log("attempting service discovery - this can drop the link", "err");
+    $("btnControls").disabled = true;
+    try {
+      var server = device.gatt;
       try {
-        var gsvc = await step("get Generic Attribute", function () {
+        var g = await step("get Generic Attribute", function () {
           return server.getPrimaryService(GATT_SVC);
         });
-        var hchar = await step("get Database Hash", function () {
-          return gsvc.getCharacteristic(DB_HASH);
-        });
-        var hv = await step("read Database Hash", function () {
-          return hchar.readValue();
+        var h = await step("read Database Hash", function () {
+          return g.getCharacteristic("00002b2a-0000-1000-8000-00805f9b34fb")
+            .then(function (c) { return c.readValue(); });
         }, READ_MS);
-        var hex = Array.prototype.map.call(new Uint8Array(hv.buffer), function (b) {
-          return ("0" + b.toString(16)).slice(-2);
-        }).join("");
-        log("   database hash " + hex + " - client is now change-aware");
-      } catch (e) {
-        if (e && e.name === "SecurityError") {
-          log("   Chrome blocks the Generic Attribute service; continuing", "err");
-        } else {
-          log("   Database Hash read did not complete (" + (e && e.name) + ")", "err");
-        }
-        jammed = false;
-      }
-
-      if (!dev.gatt.connected) { throw new Error("dropped after hash read"); }
-
-      // Battery first: a standard, normally unencrypted service. If this works
-      // and the vendor service does not, the vendor service wants a bond.
-      try {
-        var bsvc = await step("get Battery Service", function () {
-          return server.getPrimaryService("battery_service");
-        });
-        var bchar = await step("get Battery Level", function () {
-          return bsvc.getCharacteristic("battery_level");
-        });
-        var bval = await step("read battery", function () { return bchar.readValue(); }, READ_MS);
-        renderBattery(bval.getUint8(0));
-        await step("subscribe battery", function () { return bchar.startNotifications(); }, READ_MS);
-        bchar.addEventListener("characteristicvaluechanged", function (e) {
-          renderBattery(e.target.value.getUint8(0));
-        });
-      } catch (e) {
-        log("   battery unavailable - continuing", "err");
-      }
-
-      if (!dev.gatt.connected) { throw new Error("dropped before the Knog service"); }
+        log("   hash " + new Uint8Array(h.buffer)[0].toString(16) + "… - change-aware");
+      } catch (e) { /* non-fatal */ }
 
       var svc = await step("get Knog service", function () {
         return server.getPrimaryService(KNOG_SVC);
@@ -606,51 +471,50 @@
       alarmChar = await step("get Alarm Active", function () {
         return svc.getCharacteristic(ALARM_CHR);
       });
-      var v = await step("read Alarm Active", function () { return alarmChar.readValue(); }, READ_MS);
+      var v = await step("read Alarm Active", function () {
+        return alarmChar.readValue();
+      }, READ_MS);
       renderState(new Uint8Array(v.buffer));
       await step("subscribe Alarm Active", function () {
         return alarmChar.startNotifications();
       }, READ_MS);
       alarmChar.addEventListener("characteristicvaluechanged", function (e) {
         renderState(new Uint8Array(e.target.value.buffer));
-        log("alarm → " + $("word").textContent.toLowerCase());
       });
 
-      currentStep = "ready";
-      setConnected(true);
-      log("READY - arm/disarm enabled");
+      try {
+        var bs = await step("get Battery", function () {
+          return server.getPrimaryService("battery_service");
+        });
+        var bc = await bs.getCharacteristic("battery_level");
+        renderBattery((await bc.readValue()).getUint8(0));
+        await bc.startNotifications();
+        bc.addEventListener("characteristicvaluechanged", function (e) {
+          renderBattery(e.target.value.getUint8(0));
+        });
+      } catch (e) { /* optional */ }
+
+      controls = true;
+      log("app controls enabled");
+    } catch (e) {
+      log("discovery failed at: " + currentStep, "err");
+      log("Staying in link-only mode - the button on the Scout still works.", "err");
+      $("recoverCard").classList.remove("hide");
+      controls = false;
     }
+    $("btnControls").disabled = false;
+    paint();
   }
 
-  async function connect() {
-    if (keepTrying) {
-      keepTrying = false;
-      log("stopping after this attempt");
-      return;
-    }
-    if (device && device.gatt && device.gatt.connected) {
-      autoRetry = false;
-      log("disconnecting on request");
-      log("note: reconnecting after this often returns a stale handle; if reads " +
-          "start timing out, reload the page", "err");
-      releaseWake();
-      device.gatt.disconnect();
-      $("reloadRow").classList.remove("hide");
-      return;
-    }
-    if (!navigator.bluetooth) {
-      log(framed()
-        ? "blocked by the frame this page sits in, not by your browser"
-        : "Web Bluetooth unavailable in this browser (Chrome/Edge on Android only)", "err");
-      return;
-    }
-    if (device) {
-      log("reconnecting to " + (device.name || "the known device") + " - no chooser needed");
-      reconnectTries = 0;
-      await attach(device);
-      return;
-    }
-    await pick();
+  async function write(opcode, what) {
+    if (!cpChar || !isLive()) { log("controls not enabled", "err"); return; }
+    $("btnArm").disabled = true; $("btnDisarm").disabled = true;
+    try {
+      await step(what + " (control point ← " + ("0" + opcode.toString(16)).slice(-2) + ")",
+        function () { return cpChar.writeValueWithResponse(new Uint8Array([opcode])); },
+        READ_MS);
+    } catch (e) { /* logged */ }
+    paint();
   }
 
   async function pick() {
@@ -661,27 +525,28 @@
         optionalServices: [KNOG_SVC, "battery_service", GATT_SVC]
       });
       $("pickRow").classList.remove("hide");
-      await attach(dev);
+      await link(dev);
     } catch (err) {
       log("chooser: " + explain(err), "err");
-      setConnected(false);
+      paint();
     }
   }
 
-  async function write(opcode, what) {
-    if (!cpChar || !device || !device.gatt.connected) {
-      log("not connected", "err");
+  async function connect() {
+    if (keepTrying) { keepTrying = false; log("stopping"); return; }
+    if (isLive()) {
+      relink = false;
+      releaseWake();
+      log("disconnecting on request");
+      device.gatt.disconnect();
       return;
     }
-    $("btnArm").disabled = true;
-    $("btnDisarm").disabled = true;
-    try {
-      await step(what + " (control point ← " + ("0" + opcode.toString(16)).slice(-2) + ")",
-        function () { return cpChar.writeValueWithResponse(new Uint8Array([opcode])); }, READ_MS);
-    } catch (e) { /* already logged by step */ }
-    var live = device && device.gatt && device.gatt.connected;
-    $("btnArm").disabled = !live;
-    $("btnDisarm").disabled = !live;
+    if (!navigator.bluetooth) {
+      log(framed() ? "this frame blocks Bluetooth" : "Web Bluetooth unavailable", "err");
+      return;
+    }
+    if (device) { await link(device); return; }
+    await pick();
   }
 
   async function loadRemembered() {
@@ -696,60 +561,55 @@
       var n = document.createElement("span");
       n.textContent = d.name || "Unnamed device";
       var i = document.createElement("span");
-      i.className = "uuid";
-      i.textContent = "reconnect";
+      i.className = "uuid"; i.textContent = "link";
       b.appendChild(n); b.appendChild(i);
-      b.addEventListener("click", function () { attach(d); });
+      b.addEventListener("click", function () { link(d); });
       list.appendChild(b);
     });
     $("knownCard").classList.remove("hide");
-    log("remembered " + devs.length + " device(s) from a previous visit");
   }
 
   async function diagnostics() {
     var ua = navigator.userAgent;
-    var chrome = (ua.match(/Chrome\/([\d.]+)/) || [])[1];
-    var android = (ua.match(/Android ([\d.]+)/) || [])[1];
-    log("build " + BUILD);
-    log("browser: Chrome " + (chrome || "?") + " on Android " + (android || "?"));
-    log("secure context: " + window.isSecureContext + " | framed: " + framed() +
-        " | api: " + (navigator.bluetooth ? "yes" : "no"));
+    log("build " + BUILD + "  ·  link-only mode");
+    log("Chrome " + ((ua.match(/Chrome\/([\d.]+)/) || [])[1] || "?") +
+        " on Android " + ((ua.match(/Android ([\d.]+)/) || [])[1] || "?"));
     if (navigator.bluetooth && navigator.bluetooth.getAvailability) {
-      try {
-        log("adapter available: " + (await navigator.bluetooth.getAvailability()));
-      } catch (e) { /* ignore */ }
+      try { log("adapter: " + (await navigator.bluetooth.getAvailability())); } catch (e) { /* */ }
     }
   }
 
   $("btnConnect").addEventListener("click", connect);
-  $("btnPick").addEventListener("click", function () { device = null; pick(); });
-  $("btnReload").addEventListener("click", function () { location.reload(); });
+  $("btnControls").addEventListener("click", enableControls);
   $("btnArm").addEventListener("click", function () { write(ARM, "arm"); });
   $("btnDisarm").addEventListener("click", function () { write(DISARM, "disarm"); });
+  $("btnPick").addEventListener("click", function () { device = null; relink = false; pick(); });
+  $("btnReload").addEventListener("click", function () { location.reload(); });
   $("btnCopy").addEventListener("click", function () {
-    var text = $("log").innerText;
     if (navigator.clipboard) {
-      navigator.clipboard.writeText(text).then(function () {
+      navigator.clipboard.writeText($("log").innerText).then(function () {
         $("btnCopy").textContent = "Copied";
         setTimeout(function () { $("btnCopy").textContent = "Copy"; }, 1500);
       });
     }
   });
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && isLive() && !wakeLock) { acquireWake(); }
+  });
 
   diagnostics();
   if (!navigator.bluetooth) {
     if (framed()) {
-      log("this frame blocks Bluetooth - the browser is fine, the frame is not; " +
-          "host the file over HTTPS and open it directly", "err");
+      log("this frame blocks Bluetooth - open the page directly", "err");
       $("btnConnect").disabled = true;
-      $("btnConnect").textContent = "Bluetooth blocked in frame";
     } else {
       log("Web Bluetooth not available: Chrome or Edge on Android only", "err");
     }
   } else {
-    log("tap Connect to pair with your Scout");
+    log("tap Connect - it only opens the link, nothing else");
     loadRemembered();
   }
+  paint();
 })();
 </script>
 </body>
