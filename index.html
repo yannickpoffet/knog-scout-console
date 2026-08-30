@@ -148,6 +148,15 @@
     font: 400 12px "IBM Plex Mono", monospace;
     background: var(--surface-2); padding: 1px 5px; border-radius: 4px; color: var(--text);
   }
+  .known { display: flex; flex-direction: column; gap: 8px; padding: 0 12px 12px; }
+  .known button {
+    min-height: 46px; text-transform: none; letter-spacing: 0;
+    font-weight: 500; text-align: left; padding: 0 14px;
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .known .uuid {
+    font: 400 11px "IBM Plex Mono", monospace; color: var(--dim);
+  }
   .hide { display: none !important; }
 </style>
 </head>
@@ -173,6 +182,11 @@
     <button id="btnDisarm" disabled>Disarm</button>
   </div>
 
+  <div class="card hide" id="knownCard">
+    <div class="row"><span class="label">Remembered</span></div>
+    <div id="knownList" class="known"></div>
+  </div>
+
   <div class="card">
     <div class="row">
       <span class="label">Battery</span>
@@ -186,7 +200,9 @@
   <p class="note" id="note">
     Arming writes <code>01</code> to the Scout's Control Point characteristic and
     disarming writes <code>02</code>; state comes from Alarm Active notifications.
-    Chrome or Edge on Android only &mdash; Firefox and iOS have no Web Bluetooth.
+    A web page cannot list your phone&rsquo;s paired devices &mdash; Web Bluetooth
+    only ever grants the one device you pick in the browser&rsquo;s chooser.
+    Chrome or Edge on Android only; Firefox and iOS have no Web Bluetooth.
     Unofficial tool, not affiliated with Knog.
   </p>
 </div>
@@ -288,6 +304,16 @@
         filters: [{ namePrefix: "Knog" }],
         optionalServices: [KNOG_SVC, "battery_service"]
       });
+      await attach(device);
+    } catch (err) {
+      log(explain(err), "err");
+      setConnected(false);
+    }
+  }
+
+  async function attach(dev) {
+    try {
+      device = dev;
       device.addEventListener("gattserverdisconnected", onDisconnected);
 
       log("connecting to " + (device.name || "device") + "…");
@@ -341,6 +367,36 @@
     }
   }
 
+  async function loadRemembered() {
+    if (!navigator.bluetooth || !navigator.bluetooth.getDevices) { return; }
+    var devs = [];
+    try {
+      devs = await navigator.bluetooth.getDevices();
+    } catch (e) {
+      return;
+    }
+    if (!devs.length) { return; }
+    var list = $("knownList");
+    list.textContent = "";
+    devs.forEach(function (d) {
+      var b = document.createElement("button");
+      var name = document.createElement("span");
+      name.textContent = d.name || "Unnamed device";
+      var id = document.createElement("span");
+      id.className = "uuid";
+      id.textContent = "reconnect";
+      b.appendChild(name);
+      b.appendChild(id);
+      b.addEventListener("click", function () {
+        log("reconnecting to " + (d.name || "device") + "…");
+        attach(d);
+      });
+      list.appendChild(b);
+    });
+    $("knownCard").classList.remove("hide");
+    log("remembered " + devs.length + " device(s) from a previous visit");
+  }
+
   $("btnConnect").addEventListener("click", connect);
   $("btnArm").addEventListener("click", function () { write(ARM, "arm"); });
   $("btnDisarm").addEventListener("click", function () { write(DISARM, "disarm"); });
@@ -358,6 +414,7 @@
     }
   } else {
     log("tap Connect to pair with your Scout");
+    loadRemembered();
   }
 })();
 </script>
