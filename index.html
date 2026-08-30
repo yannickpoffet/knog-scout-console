@@ -264,6 +264,8 @@
 
   function explain(err) {
     var m = String(err && err.message || err);
+    var name = err && err.name;
+
     if (/permissions policy|disallowed/i.test(m)) {
       return "This page is running in a frame that blocks Bluetooth. " +
              "Open it in its own tab, or host the file yourself (GitHub Pages).";
@@ -271,8 +273,25 @@
     if (/user gesture|cancelled|User cancelled/i.test(m)) {
       return "Device chooser dismissed.";
     }
-    if (/globally disabled|not supported/i.test(m)) {
-      return "Web Bluetooth is off. Check chrome://flags and that Location is on.";
+    if (/globally disabled/i.test(m)) {
+      return "Web Bluetooth is turned off in this browser.";
+    }
+    if (name === "NotFoundError") {
+      return "No Scout offered. Turn Location on (Android needs it to scan), " +
+             "make sure the Knog app is not holding the device, and press the " +
+             "Scout's button so it advertises.";
+    }
+    if (name === "SecurityError") {
+      return "The browser blocked access to that characteristic.";
+    }
+    if (name === "NetworkError") {
+      return "Lost the connection, or the Scout refused it. If Android asked " +
+             "to pair, accept the prompt and try again; the Scout also accepts " +
+             "only one app at a time.";
+    }
+    if (name === "NotSupportedError") {
+      return "The Scout rejected the operation. If it needs an encrypted link, " +
+             "accept the Android pairing prompt and retry.";
     }
     return m;
   }
