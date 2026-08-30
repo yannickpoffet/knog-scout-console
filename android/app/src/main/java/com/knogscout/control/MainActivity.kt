@@ -54,7 +54,7 @@ class MainActivity : Activity() {
         private const val DISARM: Byte = 0x02
         private const val KEEPALIVE_MS = 4000L   // Scout drops a silent link at ~6s
         private const val MAX_DISCOVERY = 3     // per connection
-        private const val MAX_CYCLES = 24       // one per parameter combination
+        private const val MAX_CYCLES = 15       // retries; ~50% land per try
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -77,28 +77,21 @@ class MainActivity : Activity() {
             "prio=" + if (prio == BluetoothGatt.CONNECTION_PRIORITY_HIGH) "HIGH" else "BAL"
     }
 
-    private val combos: List<Combo> by lazy {
-        val out = ArrayList<Combo>()
-        // nRF Connect's shape first: direct connect, ~1.6s wait, no refresh.
-        for (delay in listOf(1600L, 600L, 3000L)) {
-            for (auto in listOf(false, true)) {
-                for (refresh in listOf(false, true)) {
-                    for (prio in listOf(
-                        BluetoothGatt.CONNECTION_PRIORITY_BALANCED,
-                        BluetoothGatt.CONNECTION_PRIORITY_HIGH
-                    )) {
-                        out.add(Combo(auto, refresh, delay, prio))
-                    }
-                }
-            }
-        }
-        out
-    }
+    // The sweep showed the same combination both succeeding and failing, so the
+    // parameters do not decide it. What decides it is whether Android serves its
+    // cache (<1s, 8 services) or does a real discovery (~5s, 0 services) - and
+    // the Scout refuses real discoveries. So: never refresh (that discards the
+    // good cache), and just retry until a cache-backed discovery lands.
+    private val combos: List<Combo> = listOf(
+        Combo(auto = false, refresh = false, delay = 1600L,
+              prio = BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
+    )
 
     private fun currentCombo(): Combo = combos[(cycle - 1).coerceAtLeast(0) % combos.size]
 
-    private val queue = ArrayDeque<() -> Unit>()
+    private val queue = ArrayDeque<Triple<String, () -> Boolean, Boolean>>()
     private var busy = false
+    private var currentOp = ""
 
     private lateinit var stateView: TextView
     private lateinit var subView: TextView
@@ -213,11 +206,7 @@ class MainActivity : Activity() {
             log("Pair it first: Settings > Bluetooth > Pair new device.")
         } else {
             log("found paired device: ${device!!.name} (${device!!.address})")
-            val prev = getSharedPreferences("knog", Context.MODE_PRIVATE)
-                .getString("combo", null)
-            if (prev != null) log("last working combination was: $prev")
-            log("Tap Connect. It sweeps ${combos.size} connection settings and")
-            log("reports which one works - leave it running.")
+            log("Tap Connect - it retries until discovery lands (about half do).")
         }
     }
 
@@ -274,6 +263,7 @@ class MainActivity : Activity() {
         try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
         gatt = null
         cpChar = null; alarmChar = null
+        ui.removeCallbacks(opWatchdog)
         queue.clear(); busy = false
         if (!wantConnection) return
         if (cycle >= MAX_CYCLES) {
@@ -320,7 +310,7 @@ class MainActivity : Activity() {
             val c = alarmChar
             val g = gatt
             if (wantConnection && g != null && c != null) {
-                enqueue { g.readCharacteristic(c) }
+                enqueue("keep-alive", quiet = true) { g.readCharacteristic(c) }
                 ui.postDelayed(this, KEEPALIVE_MS)
             }
         }
@@ -328,19 +318,43 @@ class MainActivity : Activity() {
 
     // ---------- serialized GATT queue (Android runs one op at a time) ----------
 
-    private fun enqueue(op: () -> Unit) {
-        queue.add(op)
+    private fun enqueue(name: String, quiet: Boolean = false, op: () -> Boolean) {
+        queue.add(Triple(name, op, quiet))
         if (!busy) drain()
     }
 
-    private fun drain() {
-        val op = queue.poll()
-        if (op == null) { busy = false; return }
-        busy = true
-        try { op() } catch (e: Exception) { log("op failed: ${e.message}"); busy = false; drain() }
+    private val opWatchdog = Runnable {
+        log("!! op '$currentOp' never completed - skipping")
+        busy = false
+        ui.post { drain() }
     }
 
-    private fun opDone() { busy = false; ui.post { drain() } }
+    private fun drain() {
+        val item = queue.poll()
+        if (item == null) { busy = false; return }
+        busy = true
+        currentOp = item.first
+        val started = try { item.second() } catch (e: Exception) {
+            log("op '${item.first}' threw: ${e.message}"); false
+        }
+        if (!started) {
+            // Returning false means the stack never accepted the request, so no
+            // callback is coming. Without this the queue stalls forever, the
+            // keep-alive stops, and the Scout hangs up on an idle link.
+            log("op '${item.first}' was rejected by the stack")
+            busy = false
+            ui.post { drain() }
+            return
+        }
+        if (!item.third) log("op '${item.first}' sent")
+        ui.postDelayed(opWatchdog, 3000)
+    }
+
+    private fun opDone() {
+        ui.removeCallbacks(opWatchdog)
+        busy = false
+        ui.post { drain() }
+    }
 
     // ---------- callbacks ----------
 
@@ -363,6 +377,7 @@ class MainActivity : Activity() {
                 log("link dropped (status $status)")
                 val wasReady = alarmChar != null
                 queue.clear(); busy = false
+                ui.removeCallbacks(opWatchdog)
                 cpChar = null; alarmChar = null
                 ui.removeCallbacks(keepAlive)
                 ui.post { armBtn.isEnabled = false; disarmBtn.isEnabled = false }
@@ -408,24 +423,26 @@ class MainActivity : Activity() {
             log("control point + alarm characteristic found")
 
             alarmChar?.let { ac ->
-                enqueue { g.setCharacteristicNotification(ac, true)
+                enqueue("subscribe alarm") {
+                    g.setCharacteristicNotification(ac, true)
                     val d = ac.getDescriptor(CCCD)
-                    if (d != null) {
+                    if (d == null) false else {
                         d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                         g.writeDescriptor(d)
-                    } else { opDone() }
+                    }
                 }
-                enqueue { g.readCharacteristic(ac) }
+                enqueue("read alarm") { g.readCharacteristic(ac) }
             }
             g.getService(BATT_SVC)?.getCharacteristic(BATT_CHR)?.let { bc ->
-                enqueue { g.setCharacteristicNotification(bc, true)
+                enqueue("subscribe battery") {
+                    g.setCharacteristicNotification(bc, true)
                     val d = bc.getDescriptor(CCCD)
-                    if (d != null) {
+                    if (d == null) false else {
                         d.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                         g.writeDescriptor(d)
-                    } else { opDone() }
+                    }
                 }
-                enqueue { g.readCharacteristic(bc) }
+                enqueue("read battery") { g.readCharacteristic(bc) }
             }
 
             ui.post {
@@ -435,13 +452,9 @@ class MainActivity : Activity() {
             ui.removeCallbacks(keepAlive)
             ui.postDelayed(keepAlive, KEEPALIVE_MS)
             ui.post { connectBtn.text = "Disconnect" }
-            val won = currentCombo()
             log("=========================================")
-            log("READY on attempt $cycle")
-            log("WINNING COMBINATION: ${won.label()}")
+            log("READY on attempt $cycle - arm/disarm enabled")
             log("=========================================")
-            getSharedPreferences("knog", Context.MODE_PRIVATE).edit()
-                .putString("combo", won.label()).apply()
         }
 
         @Deprecated("targetSdk 28 uses this signature")
@@ -503,7 +516,7 @@ class MainActivity : Activity() {
         val g = gatt; val c = cpChar
         if (g == null || c == null) { log("not ready"); return }
         log("$what -> control point 0x%02x".format(op))
-        enqueue {
+        enqueue("write $what") {
             c.value = byteArrayOf(op)
             c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
             g.writeCharacteristic(c)
