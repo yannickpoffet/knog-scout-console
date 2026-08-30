@@ -260,7 +260,9 @@
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
-  var BUILD = "22:25";
+  var BUILD = "22:29";
+  var GATT_SVC  = "00001801-0000-1000-8000-00805f9b34fb";  // Generic Attribute
+  var DB_HASH   = "00002b2a-0000-1000-8000-00805f9b34fb";  // Database Hash
   var ARM = 0x01, DISARM = 0x02;
   // The Scout hangs up ~5.7s after connect if discovery has not finished, so
   // every millisecond spent settling is a millisecond discovery does not get.
@@ -545,6 +547,32 @@
       }
       if (!dev.gatt.connected) { throw new Error("dropped while settling"); }
 
+      // Robust Caching: when the Scout marks a client change-unaware it
+      // answers Database Out Of Sync to everything except a Database Hash
+      // read, which is what makes the client change-aware again. Doing this
+      // first is the in-page equivalent of nRF Connect's "Refresh services".
+      try {
+        var gsvc = await step("get Generic Attribute", function () {
+          return server.getPrimaryService(GATT_SVC);
+        });
+        var hchar = await step("get Database Hash", function () {
+          return gsvc.getCharacteristic(DB_HASH);
+        });
+        var hv = await step("read Database Hash", function () {
+          return hchar.readValue();
+        }, READ_MS);
+        var hex = Array.prototype.map.call(new Uint8Array(hv.buffer), function (b) {
+          return ("0" + b.toString(16)).slice(-2);
+        }).join("");
+        log("   database hash " + hex + " - client is now change-aware");
+      } catch (e) {
+        log("   Database Hash unavailable (" + (e && e.name) + ") - Chrome may " +
+            "block the Generic Attribute service; continuing", "err");
+        jammed = false;
+      }
+
+      if (!dev.gatt.connected) { throw new Error("dropped after hash read"); }
+
       // Battery first: a standard, normally unencrypted service. If this works
       // and the vendor service does not, the vendor service wants a bond.
       try {
@@ -627,7 +655,7 @@
       log("opening the device chooser…");
       var dev = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: "Knog" }],
-        optionalServices: [KNOG_SVC, "battery_service"]
+        optionalServices: [KNOG_SVC, "battery_service", GATT_SVC]
       });
       $("pickRow").classList.remove("hide");
       await attach(dev);
