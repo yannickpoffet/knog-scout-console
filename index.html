@@ -227,6 +227,8 @@
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
   var ARM = 0x01, DISARM = 0x02;
+  var SETTLE_MS = 900;      // let encryption finish before discovery
+  var SETUP_TRIES = 5;      // whole connect+discovery attempts
 
   var STATES = {
     0: ["Off", "disarmed"],
@@ -362,10 +364,11 @@
 
   function advise() {
     log("", "err");
-    log("Setup keeps failing the same way. Most likely the Scout requires a bond:", "err");
-    log("  1. Android Settings → Bluetooth → pair \u201cKnog Scout\u201d there first", "err");
-    log("  2. Force-stop the Knog app (Settings → Apps → Knog → Force stop)", "err");
-    log("  3. Reload this page and Connect again", "err");
+    log("Still failing after " + SETUP_TRIES + " attempts. Things that clear it:", "err");
+    log("  1. Toggle Bluetooth off and on - this flushes Android's GATT cache", "err");
+    log("  2. Press the Scout's button so it is awake and advertising", "err");
+    log("  3. Make sure no other machine has it connected (it takes one at a time)", "err");
+    log("  4. If it stays broken, forget the device in Android and re-pair", "err");
   }
 
   async function attach(dev) {
@@ -374,19 +377,23 @@
     dev.removeEventListener("gattserverdisconnected", onDisconnected);
     dev.addEventListener("gattserverdisconnected", onDisconnected);
 
-    for (var i = 1; i <= 3; i++) {
+    for (var i = 1; i <= SETUP_TRIES; i++) {
       try {
         await setupOnce(dev);
+        if (i > 1) { log("recovered on attempt " + i); }
         return;
       } catch (e) {
         setConnected(false);
-        log("setup attempt " + i + "/3 failed at: " + currentStep, "err");
+        log("setup attempt " + i + "/" + SETUP_TRIES + " failed at: " + currentStep, "err");
         if (dev.gatt && dev.gatt.connected) {
           try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
         }
-        if (i < 3) {
-          var w = 1500 * i;
-          log("   retrying the whole setup in " + w + " ms");
+        if (i < SETUP_TRIES) {
+          // grow the settle window too: if the race is the cause, a longer
+          // pause on the next pass is exactly what fixes it
+          SETTLE_MS = Math.min(SETTLE_MS + 600, 3000);
+          var w = 1200 + 800 * i;
+          log("   retrying in " + w + " ms (settle now " + SETTLE_MS + " ms)");
           await sleep(w);
         } else {
           advise();
@@ -401,6 +408,13 @@
       var server = await gattConnect(dev, 2);
       connectedAt = performance.now();
       log("connected; gatt.connected=" + dev.gatt.connected);
+
+      // Android runs the bonding/encryption procedure right after connect.
+      // Firing service discovery into that window is what the Scout ignores,
+      // and an ignored discovery kills the link on the 5s supervision timeout.
+      log("→ settling " + SETTLE_MS + " ms before discovery");
+      await sleep(SETTLE_MS);
+      if (!dev.gatt.connected) { throw new Error("dropped while settling"); }
 
       // Battery first: a standard, normally unencrypted service. If this works
       // and the vendor service does not, the vendor service wants a bond.
