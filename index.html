@@ -236,7 +236,11 @@
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
   var ARM = 0x01, DISARM = 0x02;
-  var SETTLE_MS = 1500;     // let encryption finish before discovery
+  // The Scout hangs up ~5.7s after connect if discovery has not finished, so
+  // every millisecond spent settling is a millisecond discovery does not get.
+  // Keep it minimal, and drop it entirely once an attempt has failed.
+  var SETTLE_MS = 250;
+  var BUDGET_MS = 5700;
   var SETUP_TRIES = 5;      // whole connect+discovery attempts
   var READ_MS = 4000;       // reads die fast; a hung one jams Android's queue
   var jammed = false;       // a timed-out read blocks every later operation
@@ -328,13 +332,19 @@
     ]).finally(function () { clearTimeout(timer); });
   }
 
+  function sinceConnect() {
+    if (!connectedAt) { return ""; }
+    var ms = Math.round(performance.now() - connectedAt);
+    return "  [t+" + ms + "ms of ~" + BUDGET_MS + "ms]";
+  }
+
   async function step(name, fn, ms) {
     currentStep = name;
     var t0 = performance.now();
-    log("→ " + name);
+    log("→ " + name + sinceConnect());
     try {
       var r = await withTimeout(fn(), ms || 12000, name);
-      log("  ✓ " + name + "  (" + Math.round(performance.now() - t0) + " ms)");
+      log("  ✓ " + name + "  (" + Math.round(performance.now() - t0) + " ms)" + sinceConnect());
       return r;
     } catch (e) {
       log("  ✗ " + name + "  (" + Math.round(performance.now() - t0) + " ms)  " +
@@ -395,9 +405,11 @@
   function advise() {
     log("", "err");
     log("Still failing after " + SETUP_TRIES + " attempts. In order:", "err");
-    log("  1. Reload this page - clears Chrome's Bluetooth state", "err");
-    log("  2. Press the Scout's button so it is awake and advertising", "err");
-    log("  3. Toggle Bluetooth off and on - flushes Android's GATT cache", "err");
+    log("Discovery is not finishing inside the ~5.7s the Scout allows.", "err");
+    log("Android is doing a cold, full discovery of a large attribute table.", "err");
+    log("To warm its cache, connect once from another BLE app (nRF Connect)", "err");
+    log("or from Android's Bluetooth settings, then come back here - a cached", "err");
+    log("discovery returns in milliseconds and fits the window easily.", "err");
     $("reloadRow").classList.remove("hide");
   }
 
@@ -432,9 +444,8 @@
           try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
         }
         if (i < SETUP_TRIES) {
-          // grow the settle window too: if the race is the cause, a longer
-          // pause on the next pass is exactly what fixes it
-          SETTLE_MS = Math.min(SETTLE_MS + 600, 3000);
+          // give discovery the entire window from here on
+          SETTLE_MS = 0;
           var w = 1200 + 800 * i;
           log("   retrying in " + w + " ms (settle now " + SETTLE_MS + " ms)");
           await sleep(w);
@@ -455,8 +466,10 @@
       // Android runs the bonding/encryption procedure right after connect.
       // Firing service discovery into that window is what the Scout ignores,
       // and an ignored discovery kills the link on the 5s supervision timeout.
-      log("→ settling " + SETTLE_MS + " ms before discovery");
-      await sleep(SETTLE_MS);
+      if (SETTLE_MS > 0) {
+        log("→ settling " + SETTLE_MS + " ms before discovery");
+        await sleep(SETTLE_MS);
+      }
       if (!dev.gatt.connected) { throw new Error("dropped while settling"); }
 
       // Battery first: a standard, normally unencrypted service. If this works
