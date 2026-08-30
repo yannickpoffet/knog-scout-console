@@ -57,7 +57,7 @@ class MainActivity : Activity() {
         private const val DISARM: Byte = 0x02
         private const val KEEPALIVE_MS = 4000L   // Scout drops a silent link at ~6s
         private const val MAX_DISCOVERY = 3     // per connection
-        private const val MAX_CYCLES = 15       // retries; ~50% land per try
+        private const val MAX_CYCLES = 40       // long runs of failure happen
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -68,6 +68,7 @@ class MainActivity : Activity() {
     private var discoveryTries = 0
     private var wantConnection = false
     private var cycle = 0
+    private var discoverStarted = 0L
 
     // Settled empirically: a direct connect, ~1.6s settle, balanced priority,
     // and never refresh() - refreshing discards Android's cached table, which
@@ -251,14 +252,18 @@ class MainActivity : Activity() {
         queue.clear(); busy = false
         if (!wantConnection) return
         if (cycle >= MAX_CYCLES) {
-            log("gave up after $cycle attempts")
+            log("gave up after $cycle attempts.")
+            log("Every attempt did an over-the-air discovery, which this Scout")
+            log("refuses. Android only succeeds from its cached table, and the")
+            log("cache was invalidated. Try: toggle Bluetooth off and on, or")
+            log("un-pair and re-pair the Scout, then Connect again.")
             setState("FAILED", "tap Connect to try again", "#F0574A")
             wantConnection = false
             ui.post { connectBtn.text = "Connect" }
             return
         }
         cycle++
-        ui.postDelayed({ if (wantConnection) beginCycle() }, 4000)
+        ui.postDelayed({ if (wantConnection) beginCycle() }, if (cycle < 8) 4000L else 10000L)
     }
 
     private fun stop() {
@@ -276,6 +281,7 @@ class MainActivity : Activity() {
         }
         setState("OFFLINE", "not connected", "#7C8A8C")
         log("disconnected on request")
+        log("note: reconnecting can take many attempts - prefer leaving it connected")
     }
 
     private val keepAlive = object : Runnable {
@@ -342,6 +348,7 @@ class MainActivity : Activity() {
                 discoveryTries = 1
                 ui.postDelayed({
                     log("discovering services…")
+                    discoverStarted = System.currentTimeMillis()
                     g.discoverServices()
                 }, discoveryDelay)
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
@@ -367,7 +374,10 @@ class MainActivity : Activity() {
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
             val services = g.services
-            log("services discovered: status=$status count=${services.size}")
+            val ms = System.currentTimeMillis() - discoverStarted
+            val how = if (ms < 2000) "CACHE HIT" else "over the air"
+            log("services discovered: status=$status count=${services.size} " +
+                "in ${ms}ms ($how)")
 
             if (status != BluetoothGatt.GATT_SUCCESS || services.isEmpty()) {
                 if (discoveryTries < MAX_DISCOVERY) {
