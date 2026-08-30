@@ -51,7 +51,7 @@ class MainActivity : Activity() {
         private const val DISARM: Byte = 0x02
         private const val KEEPALIVE_MS = 4000L   // Scout drops a silent link at ~6s
         private const val MAX_DISCOVERY = 3     // per connection
-        private const val MAX_CYCLES = 25       // whole connect+discover cycles
+        private const val MAX_CYCLES = 24       // one per parameter combination
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -63,6 +63,36 @@ class MainActivity : Activity() {
     private var wantConnection = false
     private var useRefresh = true
     private var cycle = 0
+
+    /** One point in the search space. Discovery on this device is intermittent
+     *  and no single theory has held, so the app sweeps the combinations and
+     *  reports which one actually worked. */
+    private data class Combo(
+        val auto: Boolean, val refresh: Boolean, val delay: Long, val prio: Int
+    ) {
+        fun label() = "auto=$auto refresh=$refresh delay=${delay}ms " +
+            "prio=" + if (prio == BluetoothGatt.CONNECTION_PRIORITY_HIGH) "HIGH" else "BAL"
+    }
+
+    private val combos: List<Combo> by lazy {
+        val out = ArrayList<Combo>()
+        // nRF Connect's shape first: direct connect, ~1.6s wait, no refresh.
+        for (delay in listOf(1600L, 600L, 3000L)) {
+            for (auto in listOf(false, true)) {
+                for (refresh in listOf(false, true)) {
+                    for (prio in listOf(
+                        BluetoothGatt.CONNECTION_PRIORITY_BALANCED,
+                        BluetoothGatt.CONNECTION_PRIORITY_HIGH
+                    )) {
+                        out.add(Combo(auto, refresh, delay, prio))
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    private fun currentCombo(): Combo = combos[(cycle - 1).coerceAtLeast(0) % combos.size]
 
     private val queue = ArrayDeque<() -> Unit>()
     private var busy = false
@@ -123,11 +153,10 @@ class MainActivity : Activity() {
         }
 
         val refreshBtn = Button(this).apply {
-            text = "refresh() : ON"
+            text = "allow refresh() : YES"
             setOnClickListener {
                 useRefresh = !useRefresh
-                text = "refresh() : " + if (useRefresh) "ON" else "OFF"
-                log("refresh() is now ${if (useRefresh) "ON" else "OFF"} - reconnect to apply")
+                text = "allow refresh() : " + if (useRefresh) "YES" else "NO"
             }
         }
 
@@ -167,7 +196,11 @@ class MainActivity : Activity() {
             log("Pair it first: Settings > Bluetooth > Pair new device.")
         } else {
             log("found paired device: ${device!!.name} (${device!!.address})")
-            log("tap Connect")
+            val prev = getSharedPreferences("knog", Context.MODE_PRIVATE)
+                .getString("combo", null)
+            if (prev != null) log("last working combination was: $prev")
+            log("Tap Connect. It sweeps ${combos.size} connection settings and")
+            log("reports which one works - leave it running.")
         }
     }
 
@@ -213,9 +246,10 @@ class MainActivity : Activity() {
     private fun beginCycle() {
         val d = device ?: run { log("no paired Scout"); return }
         discoveryTries = 0
-        log("--- attempt $cycle of $MAX_CYCLES (autoConnect=false) ---")
-        setState("TRYING", "attempt $cycle", "#E0A63C")
-        gatt = d.connectGatt(this, false, callback, BluetoothDevice.TRANSPORT_LE)
+        val c = currentCombo()
+        log("--- attempt $cycle/$MAX_CYCLES : ${c.label()} ---")
+        setState("TRYING", "attempt $cycle of $MAX_CYCLES", "#E0A63C")
+        gatt = d.connectGatt(this, c.auto, callback, BluetoothDevice.TRANSPORT_LE)
     }
 
     /** Discovery failed on this link: tear it down and try a brand new one. */
@@ -299,16 +333,15 @@ class MainActivity : Activity() {
             if (newState == BluetoothGatt.STATE_CONNECTED) {
                 log("connected (status $status)")
                 setState("LINKED", "clearing cache…", "#4FBE7C")
-                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
-                log("bond state = ${bondName(g.device.bondState)}")
-                if (useRefresh) refresh(g) else log("refresh skipped (toggle off)")
+                val c = currentCombo()
+                g.requestConnectionPriority(c.prio)
+                log("bond=${bondName(g.device.bondState)}")
+                if (c.refresh && useRefresh) refresh(g)
                 discoveryTries = 1
-                // Wait for encryption + connection-parameter negotiation to
-                // settle. In the traces, discovery started ~1.6s after connect.
                 ui.postDelayed({
-                    log("discovering services (try $discoveryTries)…")
+                    log("discovering services…")
                     g.discoverServices()
-                }, 1800)
+                }, c.delay)
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                 log("link dropped (status $status)")
                 val wasReady = alarmChar != null
@@ -385,7 +418,13 @@ class MainActivity : Activity() {
             ui.removeCallbacks(keepAlive)
             ui.postDelayed(keepAlive, KEEPALIVE_MS)
             ui.post { connectBtn.text = "Disconnect" }
-            log("READY on attempt $cycle - arm/disarm enabled")
+            val won = currentCombo()
+            log("=========================================")
+            log("READY on attempt $cycle")
+            log("WINNING COMBINATION: ${won.label()}")
+            log("=========================================")
+            getSharedPreferences("knog", Context.MODE_PRIVATE).edit()
+                .putString("combo", won.label()).apply()
         }
 
         @Deprecated("targetSdk 28 uses this signature")
