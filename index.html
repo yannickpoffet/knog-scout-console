@@ -248,11 +248,10 @@
   <p class="note" id="note">
     Arming writes <code>01</code> to the Scout's Control Point characteristic and
     disarming writes <code>02</code>; state comes from Alarm Active notifications.
-    <strong>Link-only by default.</strong> Connect opens the Bluetooth link and
-    stops there &mdash; no service discovery, which is the step this Scout breaks.
-    While linked, the button on the Scout arms and disarms it.
-    <em>Enable app controls</em> additionally runs discovery to get Arm/Disarm
-    buttons here; if that fails the link survives and the device button keeps working.
+    The Scout hangs up on a silent connection after about 6 seconds, so the page
+    keeps the link busy with a read every 3 seconds once it is set up.
+    Connect links, runs discovery, then holds the connection open and
+    re-links automatically if it drops.
     Chrome or Edge on Android only; Firefox and iOS have no Web Bluetooth.
     Unofficial tool, not affiliated with Knog.
   </p>
@@ -262,7 +261,7 @@
 (function () {
   "use strict";
 
-  var BUILD = "22:47";
+  var BUILD = "23:07";
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
@@ -282,6 +281,9 @@
   var device = null, cpChar = null, alarmChar = null;
   var keepTrying = false, attemptNo = 0, relink = false;
   var wakeLock = null, controls = false, currentStep = "idle";
+  var keepAlive = null, relinkFails = 0, autoControls = true;
+  var IDLE_MS = 6000;      // measured: the Scout drops a silent link at ~6s
+  var PING_MS = 3000;      // so touch it well inside that
 
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function framed() {
@@ -391,14 +393,36 @@
     try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) { /* ignore */ }
   }
 
+  function startKeepAlive() {
+    stopKeepAlive();
+    keepAlive = setInterval(function () {
+      if (!isLive() || !alarmChar) { return; }
+      alarmChar.readValue().catch(function () { /* drop shows via event */ });
+    }, PING_MS);
+  }
+  function stopKeepAlive() {
+    if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
+  }
+
   function onDisconnected() {
+    var hadControls = controls;
     log("!! link dropped", "err");
+    stopKeepAlive();
     controls = false;
     cpChar = null; alarmChar = null;
     paint();
+    if (!hadControls) { relinkFails += 1; }
+    if (relinkFails >= 6) {
+      log("The Scout hangs up on a silent link after ~6s, and discovery is not", "err");
+      log("completing, so the link cannot be kept open. Stopping.", "err");
+      $("recoverCard").classList.remove("hide");
+      relink = false;
+      paint();
+      return;
+    }
     if (relink && device) {
       log("re-linking…");
-      setTimeout(function () { if (relink && !isLive()) { link(device); } }, 1500);
+      setTimeout(function () { if (relink && !isLive()) { link(device); } }, 1200);
     }
   }
 
@@ -423,9 +447,12 @@
         keepTrying = false;
         paint();
         await acquireWake();
-        log("LINKED - no service discovery done, so nothing can break it.");
-        log("The button on the Scout now arms and disarms.");
+        log("LINKED");
         $("pickRow").classList.remove("hide");
+        // A silent link is dropped after ~6s, so there is nothing to protect
+        // by waiting: go straight for discovery, which also creates the
+        // traffic that keeps the link open.
+        if (autoControls) { await enableControls(); }
         return;
       } catch (e) {
         if (attemptNo >= MAX_TRIES) {
@@ -447,7 +474,7 @@
   // failing it drops the link, so it is opt-in and never runs automatically.
   async function enableControls() {
     if (!isLive()) { log("not linked", "err"); return; }
-    log("attempting service discovery - this can drop the link", "err");
+    log("running discovery (also what keeps the link alive)");
     $("btnControls").disabled = true;
     try {
       var server = device.gatt;
@@ -495,10 +522,11 @@
       } catch (e) { /* optional */ }
 
       controls = true;
-      log("app controls enabled");
+      relinkFails = 0;
+      startKeepAlive();
+      log("app controls enabled - keep-alive every " + PING_MS + " ms holds the link");
     } catch (e) {
       log("discovery failed at: " + currentStep, "err");
-      log("Staying in link-only mode - the button on the Scout still works.", "err");
       $("recoverCard").classList.remove("hide");
       controls = false;
     }
