@@ -157,6 +157,14 @@
   .known .uuid {
     font: 400 11px "IBM Plex Mono", monospace; color: var(--dim);
   }
+  .logbar {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: -8px;
+  }
+  button.mini {
+    min-height: 32px; padding: 0 12px; font-size: 11px; letter-spacing: .1em;
+    border-radius: 8px; background: var(--surface-2);
+  }
   .hide { display: none !important; }
 </style>
 </head>
@@ -195,6 +203,10 @@
     <div class="bar"><i id="batBar"></i></div>
   </div>
 
+  <div class="logbar">
+    <span class="label">Event log</span>
+    <button id="btnCopy" class="mini">Copy</button>
+  </div>
   <div class="log" id="log"></div>
 
   <p class="note" id="note">
@@ -224,16 +236,23 @@
   };
 
   var $ = function (id) { return document.getElementById(id); };
+  var device = null, cpChar = null, alarmChar = null;
+  var currentStep = "idle";
+  var connectedAt = 0;
+  var autoRetry = true;
+
   function framed() {
     try { return window.self !== window.top; } catch (e) { return true; }
   }
-  var device = null, cpChar = null, alarmChar = null;
+  function sleep(ms) {
+    return new Promise(function (r) { setTimeout(r, ms); });
+  }
 
   function log(msg, cls) {
     var t = new Date().toTimeString().slice(0, 8);
     var line = document.createElement("div");
     if (cls) { line.className = cls; }
-    line.innerHTML = "<b>" + t + "</b>  " + msg;
+    line.textContent = t + "  " + msg;
     $("log").appendChild(line);
     $("log").scrollTop = $("log").scrollHeight;
   }
@@ -265,171 +284,244 @@
   function explain(err) {
     var m = String(err && err.message || err);
     var name = err && err.name;
-
     if (/permissions policy|disallowed/i.test(m)) {
-      return "This page is running in a frame that blocks Bluetooth. " +
-             "Open it in its own tab, or host the file yourself (GitHub Pages).";
+      return "running in a frame that blocks Bluetooth; host the page over HTTPS and open it directly";
     }
-    if (/user gesture|cancelled|User cancelled/i.test(m)) {
-      return "Device chooser dismissed.";
-    }
-    if (/globally disabled/i.test(m)) {
-      return "Web Bluetooth is turned off in this browser.";
-    }
+    if (/cancelled|User cancelled/i.test(m)) { return "chooser dismissed"; }
+    if (/globally disabled/i.test(m)) { return "Web Bluetooth is turned off in this browser"; }
     if (name === "NotFoundError") {
-      return "No Scout offered. Turn Location on (Android needs it to scan), " +
-             "make sure the Knog app is not holding the device, and press the " +
-             "Scout's button so it advertises.";
+      return "not offered/found - turn Location on, close the Knog app, press the Scout's button";
     }
-    if (name === "SecurityError") {
-      return "The browser blocked access to that characteristic.";
-    }
-    if (name === "NetworkError") {
-      return "Lost the connection, or the Scout refused it. If Android asked " +
-             "to pair, accept the prompt and try again; the Scout also accepts " +
-             "only one app at a time.";
-    }
-    if (name === "NotSupportedError") {
-      return "The Scout rejected the operation. If it needs an encrypted link, " +
-             "accept the Android pairing prompt and retry.";
-    }
+    if (name === "SecurityError") { return "browser blocked that characteristic"; }
+    if (name === "NetworkError") { return "link lost or refused"; }
+    if (name === "NotSupportedError") { return "GATT rejected the operation (may need an encrypted link)"; }
+    if (name === "InvalidStateError") { return "device not connected"; }
     return m;
   }
 
+  function withTimeout(promise, ms, what) {
+    var timer;
+    return Promise.race([
+      promise,
+      new Promise(function (_, rej) {
+        timer = setTimeout(function () {
+          var e = new Error(what + " timed out after " + ms + " ms");
+          e.name = "TimeoutError";
+          rej(e);
+        }, ms);
+      })
+    ]).finally(function () { clearTimeout(timer); });
+  }
+
+  async function step(name, fn, ms) {
+    currentStep = name;
+    var t0 = performance.now();
+    log("→ " + name);
+    try {
+      var r = await withTimeout(fn(), ms || 12000, name);
+      log("  ✓ " + name + "  (" + Math.round(performance.now() - t0) + " ms)");
+      return r;
+    } catch (e) {
+      log("  ✗ " + name + "  (" + Math.round(performance.now() - t0) + " ms)  " +
+          (e && e.name ? e.name + ": " : "") + explain(e), "err");
+      throw e;
+    }
+  }
+
   function onDisconnected() {
+    var held = connectedAt ? Math.round((performance.now() - connectedAt) / 100) / 10 : 0;
     setConnected(false);
     $("state").dataset.s = "-";
     $("word").textContent = "—";
     $("raw").textContent = "not connected";
-    log("disconnected", "err");
+    log("!! link dropped by the device after " + held + "s, during: " + currentStep, "err");
+    log("   the Scout accepts ONE connection at a time - close the Knog app, " +
+        "and disconnect it in Android Bluetooth settings", "err");
+    cpChar = null; alarmChar = null;
+  }
+
+  async function gattConnect(dev, attempts) {
+    var lastErr = null;
+    for (var i = 1; i <= attempts; i++) {
+      try {
+        return await step("GATT connect (attempt " + i + "/" + attempts + ")",
+          function () { return dev.gatt.connect(); }, 15000);
+      } catch (e) {
+        lastErr = e;
+        if (i < attempts) {
+          var wait = 1200 * i;
+          log("   retrying in " + wait + " ms");
+          await sleep(wait);
+        }
+      }
+    }
+    throw lastErr;
+  }
+
+  async function attach(dev) {
+    autoRetry = true;
+    try {
+      device = dev;
+      log("device: " + (dev.name || "(no name)") + "  id=" + String(dev.id).slice(0, 12) + "…");
+      dev.removeEventListener("gattserverdisconnected", onDisconnected);
+      dev.addEventListener("gattserverdisconnected", onDisconnected);
+
+      var server = await gattConnect(dev, 3);
+      connectedAt = performance.now();
+      log("connected; gatt.connected=" + dev.gatt.connected);
+
+      // Battery first: a standard, normally unencrypted service. If this works
+      // and the vendor service does not, the vendor service wants a bond.
+      try {
+        var bsvc = await step("get Battery Service", function () {
+          return server.getPrimaryService("battery_service");
+        });
+        var bchar = await step("get Battery Level", function () {
+          return bsvc.getCharacteristic("battery_level");
+        });
+        var bval = await step("read battery", function () { return bchar.readValue(); });
+        renderBattery(bval.getUint8(0));
+        await step("subscribe battery", function () { return bchar.startNotifications(); });
+        bchar.addEventListener("characteristicvaluechanged", function (e) {
+          renderBattery(e.target.value.getUint8(0));
+        });
+      } catch (e) {
+        log("   battery unavailable - continuing", "err");
+      }
+
+      if (!dev.gatt.connected) { throw new Error("dropped before the Knog service"); }
+
+      var svc = await step("get Knog service", function () {
+        return server.getPrimaryService(KNOG_SVC);
+      });
+      cpChar = await step("get Control Point", function () {
+        return svc.getCharacteristic(CP_CHR);
+      });
+      alarmChar = await step("get Alarm Active", function () {
+        return svc.getCharacteristic(ALARM_CHR);
+      });
+      var v = await step("read Alarm Active", function () { return alarmChar.readValue(); });
+      renderState(new Uint8Array(v.buffer));
+      await step("subscribe Alarm Active", function () {
+        return alarmChar.startNotifications();
+      });
+      alarmChar.addEventListener("characteristicvaluechanged", function (e) {
+        renderState(new Uint8Array(e.target.value.buffer));
+        log("alarm → " + $("word").textContent.toLowerCase());
+      });
+
+      currentStep = "ready";
+      setConnected(true);
+      log("READY - arm/disarm enabled");
+    } catch (err) {
+      setConnected(false);
+      log("connection failed at: " + currentStep, "err");
+      if (device && device.gatt && device.gatt.connected) {
+        try { device.gatt.disconnect(); } catch (e) { /* ignore */ }
+      }
+    }
   }
 
   async function connect() {
     if (device && device.gatt && device.gatt.connected) {
+      autoRetry = false;
+      log("disconnecting on request");
       device.gatt.disconnect();
       return;
     }
     if (!navigator.bluetooth) {
       log(framed()
-        ? "Blocked by the frame this page is embedded in, not by your browser. " +
-          "Host the file over HTTPS and open it directly."
-        : "Web Bluetooth unavailable in this browser. Use Chrome or Edge on Android.",
-        "err");
+        ? "blocked by the frame this page sits in, not by your browser"
+        : "Web Bluetooth unavailable in this browser (Chrome/Edge on Android only)", "err");
       return;
     }
     try {
-      log("choose your Scout in the picker…");
-      device = await navigator.bluetooth.requestDevice({
+      log("opening the device chooser…");
+      var dev = await navigator.bluetooth.requestDevice({
         filters: [{ namePrefix: "Knog" }],
         optionalServices: [KNOG_SVC, "battery_service"]
       });
-      await attach(device);
+      await attach(dev);
     } catch (err) {
-      log(explain(err), "err");
-      setConnected(false);
-    }
-  }
-
-  async function attach(dev) {
-    try {
-      device = dev;
-      device.addEventListener("gattserverdisconnected", onDisconnected);
-
-      log("connecting to " + (device.name || "device") + "…");
-      var server = await device.gatt.connect();
-
-      var svc = await server.getPrimaryService(KNOG_SVC);
-      cpChar = await svc.getCharacteristic(CP_CHR);
-      alarmChar = await svc.getCharacteristic(ALARM_CHR);
-
-      renderState(new Uint8Array((await alarmChar.readValue()).buffer));
-      await alarmChar.startNotifications();
-      alarmChar.addEventListener("characteristicvaluechanged", function (e) {
-        var b = new Uint8Array(e.target.value.buffer);
-        renderState(b);
-        log("alarm → " + $("word").textContent.toLowerCase());
-      });
-
-      try {
-        var bsvc = await server.getPrimaryService("battery_service");
-        var bchar = await bsvc.getCharacteristic("battery_level");
-        renderBattery((await bchar.readValue()).getUint8(0));
-        await bchar.startNotifications();
-        bchar.addEventListener("characteristicvaluechanged", function (e) {
-          renderBattery(e.target.value.getUint8(0));
-        });
-      } catch (e) {
-        log("battery unavailable: " + explain(e), "err");
-      }
-
-      setConnected(true);
-      log("ready");
-    } catch (err) {
-      log(explain(err), "err");
+      log("chooser: " + explain(err), "err");
       setConnected(false);
     }
   }
 
   async function write(opcode, what) {
-    if (!cpChar) { return; }
+    if (!cpChar || !device || !device.gatt.connected) {
+      log("not connected", "err");
+      return;
+    }
     $("btnArm").disabled = true;
     $("btnDisarm").disabled = true;
     try {
-      await cpChar.writeValueWithResponse(new Uint8Array([opcode]));
-      log("control point ← " + ("0" + opcode.toString(16)).slice(-2) + "  (" + what + ")");
-    } catch (err) {
-      log(what + " failed: " + explain(err), "err");
-    } finally {
-      var live = device && device.gatt && device.gatt.connected;
-      $("btnArm").disabled = !live;
-      $("btnDisarm").disabled = !live;
-    }
+      await step(what + " (control point ← " + ("0" + opcode.toString(16)).slice(-2) + ")",
+        function () { return cpChar.writeValueWithResponse(new Uint8Array([opcode])); }, 8000);
+    } catch (e) { /* already logged by step */ }
+    var live = device && device.gatt && device.gatt.connected;
+    $("btnArm").disabled = !live;
+    $("btnDisarm").disabled = !live;
   }
 
   async function loadRemembered() {
     if (!navigator.bluetooth || !navigator.bluetooth.getDevices) { return; }
     var devs = [];
-    try {
-      devs = await navigator.bluetooth.getDevices();
-    } catch (e) {
-      return;
-    }
+    try { devs = await navigator.bluetooth.getDevices(); } catch (e) { return; }
     if (!devs.length) { return; }
     var list = $("knownList");
     list.textContent = "";
     devs.forEach(function (d) {
       var b = document.createElement("button");
-      var name = document.createElement("span");
-      name.textContent = d.name || "Unnamed device";
-      var id = document.createElement("span");
-      id.className = "uuid";
-      id.textContent = "reconnect";
-      b.appendChild(name);
-      b.appendChild(id);
-      b.addEventListener("click", function () {
-        log("reconnecting to " + (d.name || "device") + "…");
-        attach(d);
-      });
+      var n = document.createElement("span");
+      n.textContent = d.name || "Unnamed device";
+      var i = document.createElement("span");
+      i.className = "uuid";
+      i.textContent = "reconnect";
+      b.appendChild(n); b.appendChild(i);
+      b.addEventListener("click", function () { attach(d); });
       list.appendChild(b);
     });
     $("knownCard").classList.remove("hide");
     log("remembered " + devs.length + " device(s) from a previous visit");
   }
 
+  async function diagnostics() {
+    var ua = navigator.userAgent;
+    var chrome = (ua.match(/Chrome\/([\d.]+)/) || [])[1];
+    var android = (ua.match(/Android ([\d.]+)/) || [])[1];
+    log("browser: Chrome " + (chrome || "?") + " on Android " + (android || "?"));
+    log("secure context: " + window.isSecureContext + " | framed: " + framed() +
+        " | api: " + (navigator.bluetooth ? "yes" : "no"));
+    if (navigator.bluetooth && navigator.bluetooth.getAvailability) {
+      try {
+        log("adapter available: " + (await navigator.bluetooth.getAvailability()));
+      } catch (e) { /* ignore */ }
+    }
+  }
+
   $("btnConnect").addEventListener("click", connect);
   $("btnArm").addEventListener("click", function () { write(ARM, "arm"); });
   $("btnDisarm").addEventListener("click", function () { write(DISARM, "disarm"); });
+  $("btnCopy").addEventListener("click", function () {
+    var text = $("log").innerText;
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(function () {
+        $("btnCopy").textContent = "Copied";
+        setTimeout(function () { $("btnCopy").textContent = "Copy"; }, 1500);
+      });
+    }
+  });
 
+  diagnostics();
   if (!navigator.bluetooth) {
     if (framed()) {
-      log("This page is embedded in a frame that blocks Bluetooth — the browser " +
-          "is fine, the frame is not. Host this file over HTTPS and open it " +
-          "directly to use it.", "err");
+      log("this frame blocks Bluetooth - the browser is fine, the frame is not; " +
+          "host the file over HTTPS and open it directly", "err");
       $("btnConnect").disabled = true;
       $("btnConnect").textContent = "Bluetooth blocked in frame";
     } else {
-      log("Web Bluetooth not available in this browser. Chrome or Edge on " +
-          "Android; Firefox and iOS do not support it.", "err");
+      log("Web Bluetooth not available: Chrome or Edge on Android only", "err");
     }
   } else {
     log("tap Connect to pair with your Scout");
