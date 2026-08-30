@@ -260,7 +260,7 @@
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
-  var BUILD = "22:29";
+  var BUILD = "22:37";
   var GATT_SVC  = "00001801-0000-1000-8000-00805f9b34fb";  // Generic Attribute
   var DB_HASH   = "00002b2a-0000-1000-8000-00805f9b34fb";  // Database Hash
   var ARM = 0x01, DISARM = 0x02;
@@ -395,8 +395,8 @@
     $("raw").textContent = "not connected";
     log("!! link dropped by the device after " + held + "s, during: " + currentStep, "err");
     if (currentStep !== "ready" && held > 0 && held < 8) {
-      log("   link closed mid-discovery - usually a stale pairing (the Scout " +
-          "holds one) or a weak signal; get closer and re-pair if needed", "err");
+      log("   link closed during discovery - the Scout is refusing requests " +
+          "(Database Out Of Sync). See the recovery steps on screen.", "err");
     }
     cpChar = null; alarmChar = null;
 
@@ -436,7 +436,7 @@
 
   function advise() {
     log("", "err");
-    log("Still failing after " + SETUP_TRIES + " attempts. In order:", "err");
+    log("Still failing after " + attemptNo + " attempts.", "err");
     log("CAUSE: Android is serving a stale, empty service table for the", "err");
     log("Scout. The Scout uses Robust Caching and marks clients out of sync", "err");
     log("when its attribute table changes; Android does not recover, caches", "err");
@@ -513,7 +513,7 @@
           keepTrying = false;
           break;
         }
-        if (attemptNo === 4) {
+        if (attemptNo === 2) {
           $("recoverCard").classList.remove("hide");
           advise();
         }
@@ -566,8 +566,11 @@
         }).join("");
         log("   database hash " + hex + " - client is now change-aware");
       } catch (e) {
-        log("   Database Hash unavailable (" + (e && e.name) + ") - Chrome may " +
-            "block the Generic Attribute service; continuing", "err");
+        if (e && e.name === "SecurityError") {
+          log("   Chrome blocks the Generic Attribute service; continuing", "err");
+        } else {
+          log("   Database Hash read did not complete (" + (e && e.name) + ")", "err");
+        }
         jammed = false;
       }
 
