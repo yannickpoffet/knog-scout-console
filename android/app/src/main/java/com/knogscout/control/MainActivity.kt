@@ -50,7 +50,8 @@ class MainActivity : Activity() {
         private const val ARM: Byte = 0x01
         private const val DISARM: Byte = 0x02
         private const val KEEPALIVE_MS = 4000L   // Scout drops a silent link at ~6s
-        private const val MAX_DISCOVERY = 4
+        private const val MAX_DISCOVERY = 3     // per connection
+        private const val MAX_CYCLES = 25       // whole connect+discover cycles
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -61,6 +62,7 @@ class MainActivity : Activity() {
     private var discoveryTries = 0
     private var wantConnection = false
     private var useRefresh = true
+    private var cycle = 0
 
     private val queue = ArrayDeque<() -> Unit>()
     private var busy = false
@@ -200,17 +202,43 @@ class MainActivity : Activity() {
     // ---------- connection ----------
 
     private fun start() {
-        val d = device ?: run { log("no paired Scout"); return }
+        cycle = 1
         wantConnection = true
+        ui.post { connectBtn.text = "Stop" }
+        beginCycle()
+    }
+
+    /** One full connect + discover attempt. Discovery is intermittent on this
+     *  device, so a fresh connection is retried until one of them works. */
+    private fun beginCycle() {
+        val d = device ?: run { log("no paired Scout"); return }
         discoveryTries = 0
-        ui.post { connectBtn.text = "Disconnect" }
-        log("connecting (autoConnect = true)…")
-        setState("LINKING", "connecting", "#E0A63C")
+        log("--- attempt $cycle of $MAX_CYCLES ---")
+        setState("TRYING", "attempt $cycle", "#E0A63C")
         gatt = d.connectGatt(this, true, callback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    /** Discovery failed on this link: tear it down and try a brand new one. */
+    private fun nextCycle() {
+        try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
+        gatt = null
+        cpChar = null; alarmChar = null
+        queue.clear(); busy = false
+        if (!wantConnection) return
+        if (cycle >= MAX_CYCLES) {
+            log("gave up after $cycle attempts")
+            setState("FAILED", "tap Connect to try again", "#F0574A")
+            wantConnection = false
+            ui.post { connectBtn.text = "Connect" }
+            return
+        }
+        cycle++
+        ui.postDelayed({ if (wantConnection) beginCycle() }, 2500)
     }
 
     private fun stop() {
         wantConnection = false
+        cycle = 0
         ui.removeCallbacks(keepAlive)
         queue.clear(); busy = false
         gatt?.disconnect()
@@ -288,7 +316,11 @@ class MainActivity : Activity() {
                 ui.removeCallbacks(keepAlive)
                 ui.post { armBtn.isEnabled = false; disarmBtn.isEnabled = false }
                 if (wantConnection) {
-                    setState("RELINKING", "autoConnect will retry", "#E0A63C")
+                    if (alarmChar == null) {
+                        setState("TRYING", "link dropped, retrying", "#E0A63C")
+                    } else {
+                        setState("RELINKING", "autoConnect will retry", "#E0A63C")
+                    }
                 } else {
                     setState("OFFLINE", "not connected", "#7C8A8C")
                 }
@@ -307,19 +339,16 @@ class MainActivity : Activity() {
                     log("empty table - retrying discovery ($discoveryTries), no refresh")
                     ui.postDelayed({ g.discoverServices() }, 1200)
                 } else {
-                    log("discovery empty after $MAX_DISCOVERY tries.")
-                    log("The Scout accepted the bond and encrypted the link, then")
-                    log("answered nothing. That is a device-side refusal, not a")
-                    log("cache problem - refresh() changed nothing across 4 passes.")
-                    setState("NO SERVICES", "device refused discovery", "#F0574A")
+                    log("empty after $MAX_DISCOVERY tries - starting a fresh connection")
+                    nextCycle()
                 }
                 return
             }
 
             val knog = g.getService(KNOG_SVC)
             if (knog == null) {
-                log("Knog service missing from the table")
-                setState("NO SERVICE", "unexpected table", "#F0574A")
+                log("Knog service missing from the table - retrying")
+                nextCycle()
                 return
             }
             cpChar = knog.getCharacteristic(CP_CHR)
@@ -353,7 +382,8 @@ class MainActivity : Activity() {
             }
             ui.removeCallbacks(keepAlive)
             ui.postDelayed(keepAlive, KEEPALIVE_MS)
-            log("ready - arm/disarm enabled")
+            ui.post { connectBtn.text = "Disconnect" }
+            log("READY on attempt $cycle - arm/disarm enabled")
         }
 
         @Deprecated("targetSdk 28 uses this signature")
