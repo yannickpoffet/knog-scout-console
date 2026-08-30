@@ -335,8 +335,10 @@
     $("word").textContent = "—";
     $("raw").textContent = "not connected";
     log("!! link dropped by the device after " + held + "s, during: " + currentStep, "err");
-    log("   the Scout accepts ONE connection at a time - close the Knog app, " +
-        "and disconnect it in Android Bluetooth settings", "err");
+    if (currentStep !== "ready") {
+      log("   dropped during setup, before any vendor characteristic was touched - " +
+          "the Scout does this when it wants an encrypted (bonded) link", "err");
+    }
     cpChar = null; alarmChar = null;
   }
 
@@ -358,15 +360,45 @@
     throw lastErr;
   }
 
-  async function attach(dev) {
-    autoRetry = true;
-    try {
-      device = dev;
-      log("device: " + (dev.name || "(no name)") + "  id=" + String(dev.id).slice(0, 12) + "…");
-      dev.removeEventListener("gattserverdisconnected", onDisconnected);
-      dev.addEventListener("gattserverdisconnected", onDisconnected);
+  function advise() {
+    log("", "err");
+    log("Setup keeps failing the same way. Most likely the Scout requires a bond:", "err");
+    log("  1. Android Settings → Bluetooth → pair \u201cKnog Scout\u201d there first", "err");
+    log("  2. Force-stop the Knog app (Settings → Apps → Knog → Force stop)", "err");
+    log("  3. Reload this page and Connect again", "err");
+  }
 
-      var server = await gattConnect(dev, 3);
+  async function attach(dev) {
+    device = dev;
+    log("device: " + (dev.name || "(no name)") + "  id=" + String(dev.id).slice(0, 12) + "…");
+    dev.removeEventListener("gattserverdisconnected", onDisconnected);
+    dev.addEventListener("gattserverdisconnected", onDisconnected);
+
+    for (var i = 1; i <= 3; i++) {
+      try {
+        await setupOnce(dev);
+        return;
+      } catch (e) {
+        setConnected(false);
+        log("setup attempt " + i + "/3 failed at: " + currentStep, "err");
+        if (dev.gatt && dev.gatt.connected) {
+          try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
+        }
+        if (i < 3) {
+          var w = 1500 * i;
+          log("   retrying the whole setup in " + w + " ms");
+          await sleep(w);
+        } else {
+          advise();
+        }
+      }
+    }
+  }
+
+  async function setupOnce(dev) {
+    autoRetry = true;
+    {
+      var server = await gattConnect(dev, 2);
       connectedAt = performance.now();
       log("connected; gatt.connected=" + dev.gatt.connected);
 
@@ -413,12 +445,6 @@
       currentStep = "ready";
       setConnected(true);
       log("READY - arm/disarm enabled");
-    } catch (err) {
-      setConnected(false);
-      log("connection failed at: " + currentStep, "err");
-      if (device && device.gatt && device.gatt.connected) {
-        try { device.gatt.disconnect(); } catch (e) { /* ignore */ }
-      }
     }
   }
 
