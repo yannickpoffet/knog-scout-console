@@ -168,6 +168,14 @@
     border-radius: 8px; background: var(--surface-2);
   }
   .pickrow { display: flex; justify-content: center; margin-top: -6px; }
+  .recover { padding: 4px 4px 14px; border-color: color-mix(in srgb, var(--s-arming) 45%, var(--line)); }
+  .recover ol { margin: 0; padding: 0 18px 0 34px; font-size: 13.5px; line-height: 1.6; }
+  .recover li { margin-bottom: 6px; }
+  .recover p { margin: 10px 16px 0; font-size: 12.5px; color: var(--dim); }
+  .recover kbd {
+    font: 400 12px "IBM Plex Mono", monospace;
+    background: var(--surface-2); padding: 1px 5px; border-radius: 4px;
+  }
   .hide { display: none !important; }
 </style>
 </head>
@@ -191,6 +199,18 @@
     <button class="primary wide" id="btnConnect">Connect</button>
     <button id="btnArm" disabled>Arm</button>
     <button id="btnDisarm" disabled>Disarm</button>
+  </div>
+
+  <div class="card recover hide" id="recoverCard">
+    <div class="row"><span class="label">Not connecting?</span></div>
+    <ol>
+      <li>Open <strong>nRF Connect</strong> and connect to the Knog Scout.</li>
+      <li><strong>While still connected</strong>, tap the menu and choose
+          <kbd>Refresh services</kbd>. It does nothing once disconnected.</li>
+      <li>Disconnect there, come back here, tap Connect.</li>
+    </ol>
+    <p>Pairing must be done in <strong>Android Settings &rsaquo; Bluetooth</strong> &mdash;
+       a web page cannot show the PIN dialog.</p>
   </div>
 
   <div class="pickrow hide" id="reloadRow">
@@ -240,14 +260,17 @@
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
-  var BUILD = "22:15";
+  var BUILD = "22:25";
   var ARM = 0x01, DISARM = 0x02;
   // The Scout hangs up ~5.7s after connect if discovery has not finished, so
   // every millisecond spent settling is a millisecond discovery does not get.
   // Keep it minimal, and drop it entirely once an attempt has failed.
   var SETTLE_MS = 250;
   var BUDGET_MS = 5700;
-  var SETUP_TRIES = 3;      // whole connect+discovery attempts
+  var MAX_TRIES = 25;       // keep trying - the failure is intermittent
+  var keepTrying = false;
+  var attemptNo = 0;
+  var wakeLock = null;
   var READ_MS = 4000;       // reads die fast; a hung one jams Android's queue
   var jammed = false;       // a timed-out read blocks every later operation
 
@@ -429,54 +452,81 @@
     $("reloadRow").classList.remove("hide");
   }
 
+  function setTrying(on) {
+    $("btnConnect").textContent = on
+      ? "Stop trying (attempt " + attemptNo + ")"
+      : (device && device.gatt && device.gatt.connected ? "Disconnect" : "Connect");
+    $("conn").textContent = on ? "Trying \u2026" : $("conn").textContent;
+  }
+
+  async function acquireWake() {
+    try {
+      if (navigator.wakeLock && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request("screen");
+        log("screen kept awake to hold the connection");
+      }
+    } catch (e) { /* not critical */ }
+  }
+
+  function releaseWake() {
+    try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) { /* ignore */ }
+  }
+
   async function attach(dev) {
     device = dev;
-    log("device: " + (dev.name || "(no name)") + "  id=" + String(dev.id).slice(0, 12) + "…");
+    log("device: " + (dev.name || "(no name)") + "  id=" + String(dev.id).slice(0, 12) + "\u2026");
     dev.removeEventListener("gattserverdisconnected", onDisconnected);
     dev.addEventListener("gattserverdisconnected", onDisconnected);
 
-    for (var i = 1; i <= SETUP_TRIES; i++) {
+    keepTrying = true;
+    attemptNo = 0;
+    setTrying(true);
+
+    while (keepTrying) {
+      attemptNo += 1;
+      setTrying(true);
       try {
         await setupOnce(dev);
-        if (i > 1) { log("recovered on attempt " + i); }
+        keepTrying = false;
         reconnectTries = 0;
+        jammed = false;
         $("pickRow").classList.remove("hide");
+        $("recoverCard").classList.add("hide");
+        if (attemptNo > 1) { log("connected on attempt " + attemptNo); }
+        await acquireWake();
+        setTrying(false);
         return;
       } catch (e) {
         setConnected(false);
-        log("setup attempt " + i + "/" + SETUP_TRIES + " failed at: " + currentStep, "err");
-        if (jammed) {
-          if (dev.gatt && dev.gatt.connected) {
-            try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
-          }
-          log("", "err");
-          log("A read timed out, which jams Android's GATT queue - every later", "err");
-          log("operation on this page will hang too. Retrying cannot clear it.", "err");
-          log("Reload the page: that resets Chrome's Bluetooth state.", "err");
-          $("reloadRow").classList.remove("hide");
-          return;
-        }
+        log("attempt " + attemptNo + " failed at: " + currentStep, "err");
         if (dev.gatt && dev.gatt.connected) {
           try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
         }
-        if (currentStep === "get Battery Service" && i >= 2) {
-          log("", "err");
-          log("Two cold discoveries in a row were cut off at the same point.", "err");
-          log("More attempts will not change this - see below.", "err");
-          advise();
-          return;
+        SETTLE_MS = 0;
+
+        if (jammed) {
+          log("a read timed out - Android's GATT queue is stuck and only a", "err");
+          log("page reload clears it.", "err");
+          $("reloadRow").classList.remove("hide");
+          keepTrying = false;
+          break;
         }
-        if (i < SETUP_TRIES) {
-          // give discovery the entire window from here on
-          SETTLE_MS = 0;
-          var w = 1200 + 800 * i;
-          log("   retrying in " + w + " ms (settle now " + SETTLE_MS + " ms)");
-          await sleep(w);
-        } else {
+        if (attemptNo === 4) {
+          $("recoverCard").classList.remove("hide");
           advise();
         }
+        if (attemptNo >= MAX_TRIES) {
+          log("gave up after " + attemptNo + " attempts", "err");
+          keepTrying = false;
+          break;
+        }
+        if (!keepTrying) { log("stopped by you"); break; }
+        var w = Math.min(1500 + 400 * attemptNo, 6000);
+        log("retrying in " + w + " ms");
+        await sleep(w);
       }
     }
+    setTrying(false);
   }
 
   async function setupOnce(dev) {
@@ -542,11 +592,17 @@
   }
 
   async function connect() {
+    if (keepTrying) {
+      keepTrying = false;
+      log("stopping after this attempt");
+      return;
+    }
     if (device && device.gatt && device.gatt.connected) {
       autoRetry = false;
       log("disconnecting on request");
       log("note: reconnecting after this often returns a stale handle; if reads " +
           "start timing out, reload the page", "err");
+      releaseWake();
       device.gatt.disconnect();
       $("reloadRow").classList.remove("hide");
       return;
