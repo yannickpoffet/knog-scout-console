@@ -237,7 +237,7 @@
   var KNOG_SVC  = "00000000-feed-0bac-5241-d8bda6932a2f";
   var CP_CHR    = "00000001-feed-0bac-5241-d8bda6932a2f";
   var ALARM_CHR = "00000002-feed-0bac-5241-d8bda6932a2f";
-  var BUILD = "21:09";
+  var BUILD = "21:21";
   var ARM = 0x01, DISARM = 0x02;
   // The Scout hangs up ~5.7s after connect if discovery has not finished, so
   // every millisecond spent settling is a millisecond discovery does not get.
@@ -367,8 +367,8 @@
     $("raw").textContent = "not connected";
     log("!! link dropped by the device after " + held + "s, during: " + currentStep, "err");
     if (currentStep !== "ready" && held > 0 && held < 8) {
-      log("   discovery did not finish inside the ~5.7s the Scout allows " +
-          "before it hangs up", "err");
+      log("   link closed mid-discovery. If Android returns an empty service " +
+          "table, it closes the link itself - forget and re-pair the device", "err");
     }
     cpChar = null; alarmChar = null;
 
@@ -409,15 +409,19 @@
   function advise() {
     log("", "err");
     log("Still failing after " + SETUP_TRIES + " attempts. In order:", "err");
-    log("The Scout wants an encrypted link and hangs up after ~5.7s if it", "err");
-    log("does not get one. Android only starts encryption when it reads a", "err");
-    log("characteristic - and a cold discovery never finishes in time to", "err");
-    log("reach one. When Android's cache is warm, discovery takes ~800ms,", "err");
-    log("the read happens, encryption fires, and everything works.", "err");
+    log("CAUSE: Android is holding a corrupt, EMPTY GATT cache for this", "err");
+    log("device. An nRF Connect trace shows encryption succeeding and", "err");
+    log("discovery returning status 0 with \u201cNo services found\u201d, after", "err");
+    log("which Android itself closes the link (TERMINATE_LOCAL_HOST).", "err");
+    log("The Scout is fine - the same device works from a Linux host that", "err");
+    log("has a valid cached table. Retrying cannot rebuild the cache.", "err");
     log("", "err");
-    log("FIX: open nRF Connect, connect to the Scout, let it list all the", "err");
-    log("services, then disconnect. That warms Android's cache for this", "err");
-    log("device. Come back here and Connect - discovery will be instant.", "err");
+    log("FIX, in order:", "err");
+    log("  1. Android Settings > Bluetooth > Knog Scout > Forget", "err");
+    log("  2. Pair it again (press the Scout's button so it advertises)", "err");
+    log("  3. Reload this page and Connect", "err");
+    log("If it persists: Settings > Apps > (show system) > Bluetooth >", "err");
+    log("Storage > Clear cache, then reboot. That wipes every GATT cache.", "err");
     $("reloadRow").classList.remove("hide");
   }
 
