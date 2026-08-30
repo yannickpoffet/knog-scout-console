@@ -60,6 +60,7 @@ class MainActivity : Activity() {
     private var alarmChar: BluetoothGattCharacteristic? = null
     private var discoveryTries = 0
     private var wantConnection = false
+    private var useRefresh = true
 
     private val queue = ArrayDeque<() -> Unit>()
     private var busy = false
@@ -119,6 +120,15 @@ class MainActivity : Activity() {
             setOnClickListener { writeCp(DISARM, "disarm") }
         }
 
+        val refreshBtn = Button(this).apply {
+            text = "refresh() : ON"
+            setOnClickListener {
+                useRefresh = !useRefresh
+                text = "refresh() : " + if (useRefresh) "ON" else "OFF"
+                log("refresh() is now ${if (useRefresh) "ON" else "OFF"} - reconnect to apply")
+            }
+        }
+
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(armBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
@@ -138,6 +148,7 @@ class MainActivity : Activity() {
         root.addView(battView)
         root.addView(connectBtn)
         root.addView(row)
+        root.addView(refreshBtn)
         root.addView(scroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
@@ -156,6 +167,12 @@ class MainActivity : Activity() {
             log("found paired device: ${device!!.name} (${device!!.address})")
             log("tap Connect")
         }
+    }
+
+    private fun bondName(state: Int) = when (state) {
+        BluetoothDevice.BOND_BONDED -> "BONDED"
+        BluetoothDevice.BOND_BONDING -> "BONDING"
+        else -> "NOT BONDED"
     }
 
     private fun findScout(adapter: BluetoothAdapter): BluetoothDevice? =
@@ -254,13 +271,16 @@ class MainActivity : Activity() {
             if (newState == BluetoothGatt.STATE_CONNECTED) {
                 log("connected (status $status)")
                 setState("LINKED", "clearing cache…", "#4FBE7C")
-                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_BALANCED)
-                refresh(g)
+                g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                log("bond state = ${bondName(g.device.bondState)}")
+                if (useRefresh) refresh(g) else log("refresh skipped (toggle off)")
                 discoveryTries = 1
+                // Wait for encryption + connection-parameter negotiation to
+                // settle. In the traces, discovery started ~1.6s after connect.
                 ui.postDelayed({
                     log("discovering services (try $discoveryTries)…")
                     g.discoverServices()
-                }, 600)
+                }, 1800)
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                 log("link dropped (status $status)")
                 queue.clear(); busy = false
@@ -282,12 +302,16 @@ class MainActivity : Activity() {
             if (status != BluetoothGatt.GATT_SUCCESS || services.isEmpty()) {
                 if (discoveryTries < MAX_DISCOVERY) {
                     discoveryTries++
-                    log("empty table - refreshing cache and retrying ($discoveryTries)")
-                    refresh(g)
-                    ui.postDelayed({ g.discoverServices() }, 800)
+                    // Deliberately NOT refreshing here: repeating it changed
+                    // nothing across four passes, so retry plainly instead.
+                    log("empty table - retrying discovery ($discoveryTries), no refresh")
+                    ui.postDelayed({ g.discoverServices() }, 1200)
                 } else {
-                    log("discovery kept coming back empty after $MAX_DISCOVERY tries")
-                    setState("NO SERVICES", "try toggling Bluetooth", "#F0574A")
+                    log("discovery empty after $MAX_DISCOVERY tries.")
+                    log("The Scout accepted the bond and encrypted the link, then")
+                    log("answered nothing. That is a device-side refusal, not a")
+                    log("cache problem - refresh() changed nothing across 4 passes.")
+                    setState("NO SERVICES", "device refused discovery", "#F0574A")
                 }
                 return
             }
