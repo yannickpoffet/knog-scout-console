@@ -213,9 +213,9 @@ class MainActivity : Activity() {
     private fun beginCycle() {
         val d = device ?: run { log("no paired Scout"); return }
         discoveryTries = 0
-        log("--- attempt $cycle of $MAX_CYCLES ---")
+        log("--- attempt $cycle of $MAX_CYCLES (autoConnect=false) ---")
         setState("TRYING", "attempt $cycle", "#E0A63C")
-        gatt = d.connectGatt(this, true, callback, BluetoothDevice.TRANSPORT_LE)
+        gatt = d.connectGatt(this, false, callback, BluetoothDevice.TRANSPORT_LE)
     }
 
     /** Discovery failed on this link: tear it down and try a brand new one. */
@@ -233,7 +233,7 @@ class MainActivity : Activity() {
             return
         }
         cycle++
-        ui.postDelayed({ if (wantConnection) beginCycle() }, 2500)
+        ui.postDelayed({ if (wantConnection) beginCycle() }, 4000)
     }
 
     private fun stop() {
@@ -311,16 +311,18 @@ class MainActivity : Activity() {
                 }, 1800)
             } else if (newState == BluetoothGatt.STATE_DISCONNECTED) {
                 log("link dropped (status $status)")
+                val wasReady = alarmChar != null
                 queue.clear(); busy = false
                 cpChar = null; alarmChar = null
                 ui.removeCallbacks(keepAlive)
                 ui.post { armBtn.isEnabled = false; disarmBtn.isEnabled = false }
                 if (wantConnection) {
-                    if (alarmChar == null) {
-                        setState("TRYING", "link dropped, retrying", "#E0A63C")
-                    } else {
-                        setState("RELINKING", "autoConnect will retry", "#E0A63C")
-                    }
+                    setState("TRYING", "reconnecting", "#E0A63C")
+                    // With autoConnect=false nothing retries on our behalf, so
+                    // drive a fresh cycle ourselves. A reconnect after a real
+                    // disconnect is the sequence that works by hand.
+                    if (wasReady) { cycle = 1 }
+                    nextCycle()
                 } else {
                     setState("OFFLINE", "not connected", "#7C8A8C")
                 }
