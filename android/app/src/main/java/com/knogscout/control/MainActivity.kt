@@ -8,6 +8,8 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
@@ -21,6 +23,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.ArrayDeque
 import java.util.Date
@@ -152,6 +155,15 @@ class MainActivity : Activity() {
             setOnClickListener { writeCp(DISARM, "disarm") }
         }
 
+        val copyBtn = Button(this).apply {
+            text = "Copy log"
+            setOnClickListener {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("Knog Scout log", logView.text))
+                Toast.makeText(this@MainActivity, "Log copied", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         val refreshBtn = Button(this).apply {
             text = "allow refresh() : YES"
             setOnClickListener {
@@ -179,7 +191,12 @@ class MainActivity : Activity() {
         root.addView(battView)
         root.addView(connectBtn)
         root.addView(row)
-        root.addView(refreshBtn)
+        val tools = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(refreshBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(copyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        root.addView(tools)
         root.addView(scroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
