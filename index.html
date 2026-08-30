@@ -191,6 +191,10 @@
     <button id="btnDisarm" disabled>Disarm</button>
   </div>
 
+  <div class="pickrow hide" id="reloadRow">
+    <button id="btnReload" class="mini">Reload page (clears Bluetooth state)</button>
+  </div>
+
   <div class="pickrow hide" id="pickRow">
     <button id="btnPick" class="mini">Pick a different device</button>
   </div>
@@ -234,6 +238,8 @@
   var ARM = 0x01, DISARM = 0x02;
   var SETTLE_MS = 1500;     // let encryption finish before discovery
   var SETUP_TRIES = 5;      // whole connect+discovery attempts
+  var READ_MS = 4000;       // reads die fast; a hung one jams Android's queue
+  var jammed = false;       // a timed-out read blocks every later operation
 
   var STATES = {
     0: ["Off", "disarmed"],
@@ -248,6 +254,7 @@
   var connectedAt = 0;
   var autoRetry = true;
   var reconnectTries = 0;
+  var everDisconnected = false;
 
   function framed() {
     try { return window.self !== window.top; } catch (e) { return true; }
@@ -332,21 +339,23 @@
     } catch (e) {
       log("  ✗ " + name + "  (" + Math.round(performance.now() - t0) + " ms)  " +
           (e && e.name ? e.name + ": " : "") + explain(e), "err");
+      if (e && e.name === "TimeoutError") { jammed = true; }
       throw e;
     }
   }
 
   function onDisconnected() {
     var wasReady = (currentStep === "ready");
+    everDisconnected = true;
     var held = connectedAt ? Math.round((performance.now() - connectedAt) / 100) / 10 : 0;
     setConnected(false);
     $("state").dataset.s = "-";
     $("word").textContent = "—";
     $("raw").textContent = "not connected";
     log("!! link dropped by the device after " + held + "s, during: " + currentStep, "err");
-    if (currentStep !== "ready") {
-      log("   dropped during setup, before any vendor characteristic was touched - " +
-          "the Scout does this when it wants an encrypted (bonded) link", "err");
+    if (currentStep !== "ready" && held > 0 && held < 8) {
+      log("   dropped mid-setup on the ~5s supervision timeout: the Scout " +
+          "answered nothing at all", "err");
     }
     cpChar = null; alarmChar = null;
 
@@ -364,8 +373,13 @@
     var lastErr = null;
     for (var i = 1; i <= attempts; i++) {
       try {
-        return await step("GATT connect (attempt " + i + "/" + attempts + ")",
+        var t0 = performance.now();
+        var srv = await step("GATT connect (attempt " + i + "/" + attempts + ")",
           function () { return dev.gatt.connect(); }, 15000);
+        if (performance.now() - t0 < 150 && everDisconnected) {
+          log("   ! returned in <150ms - this is a cached handle, not a new link", "err");
+        }
+        return srv;
       } catch (e) {
         lastErr = e;
         if (i < attempts) {
@@ -380,11 +394,11 @@
 
   function advise() {
     log("", "err");
-    log("Still failing after " + SETUP_TRIES + " attempts. Things that clear it:", "err");
-    log("  1. Toggle Bluetooth off and on - this flushes Android's GATT cache", "err");
+    log("Still failing after " + SETUP_TRIES + " attempts. In order:", "err");
+    log("  1. Reload this page - clears Chrome's Bluetooth state", "err");
     log("  2. Press the Scout's button so it is awake and advertising", "err");
-    log("  3. Make sure no other machine has it connected (it takes one at a time)", "err");
-    log("  4. If it stays broken, forget the device in Android and re-pair", "err");
+    log("  3. Toggle Bluetooth off and on - flushes Android's GATT cache", "err");
+    $("reloadRow").classList.remove("hide");
   }
 
   async function attach(dev) {
@@ -403,6 +417,17 @@
       } catch (e) {
         setConnected(false);
         log("setup attempt " + i + "/" + SETUP_TRIES + " failed at: " + currentStep, "err");
+        if (jammed) {
+          if (dev.gatt && dev.gatt.connected) {
+            try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
+          }
+          log("", "err");
+          log("A read timed out, which jams Android's GATT queue - every later", "err");
+          log("operation on this page will hang too. Retrying cannot clear it.", "err");
+          log("Reload the page: that resets Chrome's Bluetooth state.", "err");
+          $("reloadRow").classList.remove("hide");
+          return;
+        }
         if (dev.gatt && dev.gatt.connected) {
           try { dev.gatt.disconnect(); } catch (x) { /* ignore */ }
         }
@@ -443,9 +468,9 @@
         var bchar = await step("get Battery Level", function () {
           return bsvc.getCharacteristic("battery_level");
         });
-        var bval = await step("read battery", function () { return bchar.readValue(); });
+        var bval = await step("read battery", function () { return bchar.readValue(); }, READ_MS);
         renderBattery(bval.getUint8(0));
-        await step("subscribe battery", function () { return bchar.startNotifications(); });
+        await step("subscribe battery", function () { return bchar.startNotifications(); }, READ_MS);
         bchar.addEventListener("characteristicvaluechanged", function (e) {
           renderBattery(e.target.value.getUint8(0));
         });
@@ -464,11 +489,11 @@
       alarmChar = await step("get Alarm Active", function () {
         return svc.getCharacteristic(ALARM_CHR);
       });
-      var v = await step("read Alarm Active", function () { return alarmChar.readValue(); });
+      var v = await step("read Alarm Active", function () { return alarmChar.readValue(); }, READ_MS);
       renderState(new Uint8Array(v.buffer));
       await step("subscribe Alarm Active", function () {
         return alarmChar.startNotifications();
-      });
+      }, READ_MS);
       alarmChar.addEventListener("characteristicvaluechanged", function (e) {
         renderState(new Uint8Array(e.target.value.buffer));
         log("alarm → " + $("word").textContent.toLowerCase());
@@ -484,7 +509,10 @@
     if (device && device.gatt && device.gatt.connected) {
       autoRetry = false;
       log("disconnecting on request");
+      log("note: reconnecting after this often returns a stale handle; if reads " +
+          "start timing out, reload the page", "err");
       device.gatt.disconnect();
+      $("reloadRow").classList.remove("hide");
       return;
     }
     if (!navigator.bluetooth) {
@@ -526,7 +554,7 @@
     $("btnDisarm").disabled = true;
     try {
       await step(what + " (control point ← " + ("0" + opcode.toString(16)).slice(-2) + ")",
-        function () { return cpChar.writeValueWithResponse(new Uint8Array([opcode])); }, 8000);
+        function () { return cpChar.writeValueWithResponse(new Uint8Array([opcode])); }, READ_MS);
     } catch (e) { /* already logged by step */ }
     var live = device && device.gatt && device.gatt.connected;
     $("btnArm").disabled = !live;
@@ -571,6 +599,7 @@
 
   $("btnConnect").addEventListener("click", connect);
   $("btnPick").addEventListener("click", function () { device = null; pick(); });
+  $("btnReload").addEventListener("click", function () { location.reload(); });
   $("btnArm").addEventListener("click", function () { write(ARM, "arm"); });
   $("btnDisarm").addEventListener("click", function () { write(DISARM, "disarm"); });
   $("btnCopy").addEventListener("click", function () {
