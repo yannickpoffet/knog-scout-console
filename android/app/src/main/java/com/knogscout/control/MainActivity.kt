@@ -9,20 +9,27 @@ import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
+import android.content.BroadcastReceiver
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.text.method.ScrollingMovementMethod
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -33,16 +40,6 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
-/**
- * Minimal Knog Scout controller.
- *
- * The three things a browser could not do, and why they are here:
- *  - refresh() clears Android's cached attribute table before every discovery,
- *    which is what stops the Scout answering Database Out Of Sync.
- *  - autoConnect = true uses the patient connection strategy.
- *  - discovery is retried on a held connection when it returns an empty table,
- *    instead of tearing the link down.
- */
 class MainActivity : Activity() {
 
     companion object {
@@ -55,9 +52,23 @@ class MainActivity : Activity() {
 
         private const val ARM: Byte = 0x01
         private const val DISARM: Byte = 0x02
-        private const val KEEPALIVE_MS = 4000L   // Scout drops a silent link at ~6s
-        private const val MAX_DISCOVERY = 3     // per connection
-        private const val MAX_CYCLES = 40       // long runs of failure happen
+        private const val KEEPALIVE_MS = 4000L
+        private const val MAX_DISCOVERY = 3
+        private const val MAX_CYCLES = 40
+
+        // Palette lifted from the web console so the two feel like one tool.
+        private const val BG = "#0E1416"
+        private const val SURFACE = "#161E21"
+        private const val SURFACE2 = "#1D2629"
+        private const val LINE = "#2A3639"
+        private const val TEXT = "#E6EDEC"
+        private const val DIM = "#8B9B9D"
+        private const val ACCENT = "#4FC4C4"
+        private const val ON_ACCENT = "#06191B"
+        private const val S_OFF = "#7C8A8C"
+        private const val S_ARMING = "#E0A63C"
+        private const val S_ON = "#4FBE7C"
+        private const val S_RING = "#F0574A"
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -70,9 +81,6 @@ class MainActivity : Activity() {
     private var cycle = 0
     private var discoverStarted = 0L
 
-    // Settled empirically: a direct connect, ~1.6s settle, balanced priority,
-    // and never refresh() - refreshing discards Android's cached table, which
-    // is the only thing the Scout will serve.
     private val autoConnect = false
     private val discoveryDelay = 1600L
     private val priority = BluetoothGatt.CONNECTION_PRIORITY_BALANCED
@@ -81,150 +89,358 @@ class MainActivity : Activity() {
     private var busy = false
     private var currentOp = ""
 
-    private lateinit var stateView: TextView
-    private lateinit var subView: TextView
-    private lateinit var battView: TextView
+    private lateinit var pill: TextView
+    private lateinit var eyebrow: TextView
+    private lateinit var stateWord: TextView
+    private lateinit var stateSub: TextView
+    private lateinit var stateCardBg: GradientDrawable
+    private lateinit var battValue: TextView
+    private lateinit var battFill: View
     private lateinit var logView: TextView
+    private lateinit var logScroll: ScrollView
     private lateinit var connectBtn: Button
     private lateinit var armBtn: Button
     private lateinit var disarmBtn: Button
 
-    // ---------- UI ----------
+    private fun dp(v: Float) = (v * resources.displayMetrics.density)
+    private fun dpi(v: Float) = dp(v).toInt()
+    private fun col(hex: String) = Color.parseColor(hex)
+
+    // ---------------------------------------------------------------- UI
+
+    private fun cardBg(stroke: String = LINE, fill: String = SURFACE) =
+        GradientDrawable().apply {
+            setColor(col(fill))
+            cornerRadius = dp(14f)
+            setStroke(dpi(1f), col(stroke))
+        }
+
+    private fun styledButton(label: String, primary: Boolean): Button {
+        val bg = GradientDrawable().apply {
+            setColor(col(if (primary) ACCENT else SURFACE))
+            cornerRadius = dp(12f)
+            setStroke(dpi(1f), col(if (primary) ACCENT else LINE))
+        }
+        return Button(this).apply {
+            text = label
+            isAllCaps = true
+            textSize = 14f
+            setTypeface(Typeface.DEFAULT_BOLD)
+            setTextColor(col(if (primary) ON_ACCENT else TEXT))
+            background = bg
+            minHeight = dpi(56f)
+            stateListAnimator = null
+        }
+    }
+
+    private fun label(t: String) = TextView(this).apply {
+        text = t
+        textSize = 11f
+        letterSpacing = 0.12f
+        typeface = Typeface.MONOSPACE
+        setTextColor(col(DIM))
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val pad = (16 * resources.displayMetrics.density).toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            setBackgroundColor(Color.parseColor("#0E1416"))
+            setBackgroundColor(col(BG))
+            setPadding(dpi(16f), dpi(20f), dpi(16f), dpi(16f))
         }
 
-        stateView = TextView(this).apply {
-            textSize = 40f
-            setTypeface(Typeface.DEFAULT_BOLD)
-            setTextColor(Color.parseColor("#7C8A8C"))
-            gravity = Gravity.CENTER
+        // header ------------------------------------------------------
+        val title = TextView(this).apply {
+            text = "SCOUT ALARM"
+            textSize = 22f
+            letterSpacing = 0.04f
+            setTypeface(Typeface.create("sans-serif-condensed", Typeface.BOLD))
+            setTextColor(col(TEXT))
+        }
+        pill = TextView(this).apply {
             text = "OFFLINE"
+            textSize = 10f
+            letterSpacing = 0.09f
+            typeface = Typeface.MONOSPACE
+            setTextColor(col(DIM))
+            background = GradientDrawable().apply {
+                setColor(Color.TRANSPARENT); cornerRadius = dp(999f)
+                setStroke(dpi(1f), col(LINE))
+            }
+            setPadding(dpi(10f), dpi(6f), dpi(10f), dpi(6f))
         }
-        subView = TextView(this).apply {
-            textSize = 14f
-            setTextColor(Color.parseColor("#8B9B9D"))
-            gravity = Gravity.CENTER
-            text = "not connected"
-        }
-        battView = TextView(this).apply {
-            textSize = 16f
-            setTextColor(Color.parseColor("#E6EDEC"))
-            gravity = Gravity.CENTER
-            text = "Battery --%"
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(pill)
         }
 
-        connectBtn = Button(this).apply {
-            text = "Connect"
-            setOnClickListener { if (wantConnection) stop() else start() }
+        // state hero --------------------------------------------------
+        stateCardBg = cardBg()
+        eyebrow = label("ALARM STATE").apply { gravity = Gravity.CENTER }
+        stateWord = TextView(this).apply {
+            text = "—"
+            textSize = 44f
+            letterSpacing = 0.02f
+            gravity = Gravity.CENTER
+            setTypeface(Typeface.create("sans-serif-condensed", Typeface.BOLD))
+            setTextColor(col(S_OFF))
         }
-        armBtn = Button(this).apply {
-            text = "ARM"
+        stateSub = TextView(this).apply {
+            text = "not connected"
+            textSize = 13f
+            gravity = Gravity.CENTER
+            typeface = Typeface.MONOSPACE
+            setTextColor(col(DIM))
+        }
+        val stateCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = stateCardBg
+            setPadding(dpi(20f), dpi(22f), dpi(20f), dpi(20f))
+            addView(eyebrow); addView(stateWord); addView(stateSub)
+        }
+
+        // actions -----------------------------------------------------
+        connectBtn = styledButton("Connect", true).apply {
+            setOnClickListener { onConnectPressed() }
+        }
+        armBtn = styledButton("Arm", false).apply {
             isEnabled = false
             setOnClickListener { writeCp(ARM, "arm") }
         }
-        disarmBtn = Button(this).apply {
-            text = "DISARM"
+        disarmBtn = styledButton("Disarm", false).apply {
             isEnabled = false
             setOnClickListener { writeCp(DISARM, "disarm") }
         }
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(armBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { rightMargin = dpi(6f) })
+            addView(disarmBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { leftMargin = dpi(6f) })
+        }
 
+        // battery -----------------------------------------------------
+        battValue = TextView(this).apply {
+            text = "––%"
+            textSize = 19f
+            typeface = Typeface.MONOSPACE
+            setTextColor(col(TEXT))
+        }
+        val battRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label("BATTERY"),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(battValue)
+        }
+        battFill = View(this).apply {
+            background = GradientDrawable().apply {
+                setColor(col(S_ON)); cornerRadius = dp(3f)
+            }
+        }
+        val track = FrameLayout(this).apply {
+            background = GradientDrawable().apply {
+                setColor(col(SURFACE2)); cornerRadius = dp(3f)
+            }
+            addView(battFill, FrameLayout.LayoutParams(0, dpi(6f)))
+        }
+        val battCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardBg()
+            setPadding(dpi(16f), dpi(14f), dpi(16f), dpi(14f))
+            addView(battRow)
+            addView(track, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dpi(6f))
+                .apply { topMargin = dpi(10f) })
+        }
+
+        // log ---------------------------------------------------------
         val copyBtn = Button(this).apply {
-            text = "Copy log"
+            text = "COPY"
+            textSize = 11f
+            isAllCaps = true
+            setTextColor(col(TEXT))
+            background = GradientDrawable().apply {
+                setColor(col(SURFACE2)); cornerRadius = dp(8f)
+                setStroke(dpi(1f), col(LINE))
+            }
+            minHeight = dpi(34f)
+            minWidth = dpi(72f)
+            stateListAnimator = null
             setOnClickListener {
                 val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 cm.setPrimaryClip(ClipData.newPlainText("Knog Scout log", logView.text))
                 Toast.makeText(this@MainActivity, "Log copied", Toast.LENGTH_SHORT).show()
             }
         }
-
-        val row = LinearLayout(this).apply {
+        val logHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(armBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            addView(disarmBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            gravity = Gravity.CENTER_VERTICAL
+            addView(label("EVENT LOG"),
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(copyBtn)
         }
-
         logView = TextView(this).apply {
             textSize = 11f
-            setTextColor(Color.parseColor("#8B9B9D"))
             typeface = Typeface.MONOSPACE
+            setTextColor(col(DIM))
             movementMethod = ScrollingMovementMethod()
         }
-        val scroll = ScrollView(this).apply { addView(logView) }
-
-        root.addView(stateView)
-        root.addView(subView)
-        root.addView(battView)
-        root.addView(connectBtn)
-        root.addView(row)
-        val tools = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(copyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        logScroll = ScrollView(this).apply {
+            background = GradientDrawable().apply {
+                setColor(col(SURFACE2)); cornerRadius = dp(14f)
+                setStroke(dpi(1f), col(LINE))
+            }
+            setPadding(dpi(12f), dpi(10f), dpi(12f), dpi(10f))
+            addView(logView)
         }
-        root.addView(tools)
-        root.addView(scroll, LinearLayout.LayoutParams(
+
+        fun gap(h: Float) = View(this).also {
+            root.addView(it, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dpi(h)))
+        }
+
+        root.addView(header); gap(16f)
+        root.addView(stateCard); gap(14f)
+        root.addView(connectBtn); gap(10f)
+        root.addView(actions); gap(14f)
+        root.addView(battCard); gap(14f)
+        root.addView(logHeader); gap(6f)
+        root.addView(logScroll, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         setContentView(root)
 
+        registerReceiver(btReceiver, IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED))
+
         if (Build.VERSION.SDK_INT >= 31 &&
             checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) !=
                 PackageManager.PERMISSION_GRANTED) {
-            log("requesting Bluetooth permission…")
             requestPermissions(arrayOf(Manifest.permission.BLUETOOTH_CONNECT), 1)
         }
 
-        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager).adapter
-        if (adapter == null || !adapter.isEnabled) {
-            log("Bluetooth is off - enable it and reopen the app")
+        refreshAdapterState()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        try { unregisterReceiver(btReceiver) } catch (e: Exception) { /* ignore */ }
+        ui.removeCallbacks(keepAlive)
+        ui.removeCallbacks(opWatchdog)
+        gatt?.close()
+    }
+
+    // ------------------------------------------------- bluetooth state
+
+    private fun adapter(): BluetoothAdapter? =
+        (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter
+
+    private val btReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context?, i: Intent?) {
+            if (i?.action != BluetoothAdapter.ACTION_STATE_CHANGED) return
+            when (i.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1)) {
+                BluetoothAdapter.STATE_OFF -> {
+                    log("Bluetooth turned off")
+                    hardStop()
+                    refreshAdapterState()
+                }
+                BluetoothAdapter.STATE_ON -> {
+                    log("Bluetooth turned on")
+                    refreshAdapterState()
+                }
+                BluetoothAdapter.STATE_TURNING_OFF ->
+                    setState("BLUETOOTH", "turning off…", S_ARMING)
+            }
+        }
+    }
+
+    /** Single place that decides what the screen says when idle. */
+    private fun refreshAdapterState() {
+        val a = adapter()
+        when {
+            a == null -> {
+                setState("NO BLUETOOTH", "this device has no adapter", S_RING)
+                setPill("NO BT", S_RING)
+                connectBtn.isEnabled = false
+                connectBtn.text = "Unavailable"
+            }
+            !a.isEnabled -> {
+                setState("BLUETOOTH OFF", "turn Bluetooth on to continue", S_RING)
+                setPill("BT OFF", S_RING)
+                connectBtn.isEnabled = true
+                connectBtn.text = "Turn on Bluetooth"
+                armBtn.isEnabled = false; disarmBtn.isEnabled = false
+                log("Bluetooth is off - tap the button to open settings")
+            }
+            else -> {
+                device = findScout(a)
+                if (device == null) {
+                    setState("NOT PAIRED", "pair the Scout in Settings", S_ARMING)
+                    setPill("NO DEVICE", S_ARMING)
+                    connectBtn.isEnabled = true
+                    connectBtn.text = "Open Bluetooth settings"
+                    log("No paired Knog Scout found.")
+                } else {
+                    setState("READY", "tap Connect", S_OFF)
+                    setPill("OFFLINE", DIM)
+                    connectBtn.isEnabled = true
+                    connectBtn.text = "Connect"
+                    log("paired device: ${device!!.name} (${device!!.address})")
+                }
+            }
+        }
+    }
+
+    private fun onConnectPressed() {
+        val a = adapter()
+        if (a == null) return
+        if (!a.isEnabled || device == null) {
+            startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS))
             return
         }
-        device = findScout(adapter)
-        if (device == null) {
-            log("No paired Knog Scout found.")
-            log("Pair it first: Settings > Bluetooth > Pair new device.")
-        } else {
-            log("found paired device: ${device!!.name} (${device!!.address})")
-            log("Tap Connect - it retries until discovery lands (about half do).")
-        }
+        if (wantConnection) hardStop() else start()
     }
 
-    private fun bondName(state: Int) = when (state) {
-        BluetoothDevice.BOND_BONDED -> "BONDED"
-        BluetoothDevice.BOND_BONDING -> "BONDING"
-        else -> "NOT BONDED"
-    }
-
-    private fun findScout(adapter: BluetoothAdapter): BluetoothDevice? =
-        adapter.bondedDevices?.firstOrNull {
-            (it.name ?: "").contains("Knog", ignoreCase = true) ||
-            (it.name ?: "").contains("Scout", ignoreCase = true)
+    private fun findScout(a: BluetoothAdapter): BluetoothDevice? = try {
+        a.bondedDevices?.firstOrNull {
+            (it.name ?: "").contains("Knog", true) || (it.name ?: "").contains("Scout", true)
         }
+    } catch (e: SecurityException) { null }
+
+    // ------------------------------------------------------- rendering
 
     private fun log(msg: String) {
         val t = SimpleDateFormat("HH:mm:ss", Locale.US).format(Date())
         ui.post {
             logView.append("$t  $msg\n")
-            (logView.parent as? ScrollView)?.fullScroll(ScrollView.FOCUS_DOWN)
+            logScroll.post { logScroll.fullScroll(ScrollView.FOCUS_DOWN) }
         }
     }
 
-    private fun setState(word: String, sub: String, color: String) {
-        ui.post {
-            stateView.text = word
-            stateView.setTextColor(Color.parseColor(color))
-            subView.text = sub
-        }
+    private fun setPill(text: String, color: String) = ui.post {
+        pill.text = text
+        pill.setTextColor(col(color))
+        (pill.background as? GradientDrawable)?.setStroke(dpi(1f), col(color))
     }
 
-    // ---------- connection ----------
+    private fun setState(word: String, sub: String, color: String) = ui.post {
+        stateWord.text = word
+        stateWord.setTextColor(col(color))
+        stateSub.text = sub
+        stateCardBg.setStroke(dpi(1f), col(color))
+    }
+
+    private fun renderBattery(pct: Int) = ui.post {
+        battValue.text = "$pct%"
+        val track = battFill.parent as? FrameLayout ?: return@post
+        battFill.layoutParams = FrameLayout.LayoutParams(
+            (track.width * pct / 100).coerceAtLeast(0), dpi(6f))
+        battFill.requestLayout()
+    }
+
+    // ------------------------------------------------------ connection
 
     private fun start() {
         cycle = 1
@@ -233,61 +449,55 @@ class MainActivity : Activity() {
         beginCycle()
     }
 
-    /** One full connect + discover attempt. Discovery is intermittent on this
-     *  device, so a fresh connection is retried until one of them works. */
     private fun beginCycle() {
-        val d = device ?: run { log("no paired Scout"); return }
+        val d = device ?: return
         discoveryTries = 0
         log("--- attempt $cycle of $MAX_CYCLES ---")
-        setState("TRYING", "attempt $cycle of $MAX_CYCLES", "#E0A63C")
+        setState("CONNECTING", "attempt $cycle of $MAX_CYCLES", S_ARMING)
+        setPill("TRYING", S_ARMING)
         gatt = d.connectGatt(this, autoConnect, callback, BluetoothDevice.TRANSPORT_LE)
     }
 
-    /** Discovery failed on this link: tear it down and try a brand new one. */
     private fun nextCycle() {
         try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
-        gatt = null
-        cpChar = null; alarmChar = null
+        gatt = null; cpChar = null; alarmChar = null
         ui.removeCallbacks(opWatchdog)
         queue.clear(); busy = false
         if (!wantConnection) return
         if (cycle >= MAX_CYCLES) {
             log("gave up after $cycle attempts.")
-            log("Every attempt did an over-the-air discovery, which this Scout")
-            log("refuses. Android only succeeds from its cached table, and the")
-            log("cache was invalidated. Try: toggle Bluetooth off and on, or")
-            log("un-pair and re-pair the Scout, then Connect again.")
-            setState("FAILED", "tap Connect to try again", "#F0574A")
+            log("Every attempt rediscovered over the air, which this Scout")
+            log("refuses. Toggle Bluetooth off/on, or re-pair, then retry.")
+            setState("FAILED", "tap Connect to try again", S_RING)
+            setPill("FAILED", S_RING)
             wantConnection = false
             ui.post { connectBtn.text = "Connect" }
             return
         }
         cycle++
-        ui.postDelayed({ if (wantConnection) beginCycle() }, if (cycle < 8) 4000L else 10000L)
+        ui.postDelayed({ if (wantConnection) beginCycle() },
+            if (cycle < 8) 4000L else 10000L)
     }
 
-    private fun stop() {
+    private fun hardStop() {
         wantConnection = false
         cycle = 0
         ui.removeCallbacks(keepAlive)
+        ui.removeCallbacks(opWatchdog)
         queue.clear(); busy = false
-        gatt?.disconnect()
-        gatt?.close()
-        gatt = null
-        cpChar = null; alarmChar = null
+        try { gatt?.disconnect(); gatt?.close() } catch (e: Exception) { /* ignore */ }
+        gatt = null; cpChar = null; alarmChar = null
         ui.post {
             connectBtn.text = "Connect"
             armBtn.isEnabled = false; disarmBtn.isEnabled = false
         }
-        setState("OFFLINE", "not connected", "#7C8A8C")
-        log("disconnected on request")
-        log("note: reconnecting can take many attempts - prefer leaving it connected")
+        setPill("OFFLINE", DIM)
+        setState("OFFLINE", "not connected", S_OFF)
     }
 
     private val keepAlive = object : Runnable {
         override fun run() {
-            val c = alarmChar
-            val g = gatt
+            val c = alarmChar; val g = gatt
             if (wantConnection && g != null && c != null) {
                 enqueue("keep-alive", quiet = true) { g.readCharacteristic(c) }
                 ui.postDelayed(this, KEEPALIVE_MS)
@@ -295,7 +505,7 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- serialized GATT queue (Android runs one op at a time) ----------
+    // ----------------------------------------------------- op queue
 
     private fun enqueue(name: String, quiet: Boolean = false, op: () -> Boolean) {
         queue.add(Triple(name, op, quiet))
@@ -309,18 +519,12 @@ class MainActivity : Activity() {
     }
 
     private fun drain() {
-        val item = queue.poll()
-        if (item == null) { busy = false; return }
+        val item = queue.poll() ?: run { busy = false; return }
         busy = true
         currentOp = item.first
-        val started = try { item.second() } catch (e: Exception) {
-            log("op '${item.first}' threw: ${e.message}"); false
-        }
+        val started = try { item.second() } catch (e: Exception) { false }
         if (!started) {
-            // Returning false means the stack never accepted the request, so no
-            // callback is coming. Without this the queue stalls forever, the
-            // keep-alive stops, and the Scout hangs up on an idle link.
-            log("op '${item.first}' was rejected by the stack")
+            log("op '${item.first}' rejected by the stack")
             busy = false
             ui.post { drain() }
             return
@@ -335,16 +539,16 @@ class MainActivity : Activity() {
         ui.post { drain() }
     }
 
-    // ---------- callbacks ----------
+    // ------------------------------------------------------ callbacks
 
     private val callback = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothGatt.STATE_CONNECTED) {
                 log("connected (status $status)")
-                setState("LINKED", "clearing cache…", "#4FBE7C")
+                setState("CONNECTED", "discovering services…", S_ARMING)
+                setPill("LINKED", S_ON)
                 g.requestConnectionPriority(priority)
-                log("bond=${bondName(g.device.bondState)}")
                 discoveryTries = 1
                 ui.postDelayed({
                     log("discovering services…")
@@ -356,18 +560,16 @@ class MainActivity : Activity() {
                 val wasReady = alarmChar != null
                 queue.clear(); busy = false
                 ui.removeCallbacks(opWatchdog)
-                cpChar = null; alarmChar = null
                 ui.removeCallbacks(keepAlive)
+                cpChar = null; alarmChar = null
                 ui.post { armBtn.isEnabled = false; disarmBtn.isEnabled = false }
                 if (wantConnection) {
-                    setState("TRYING", "reconnecting", "#E0A63C")
-                    // With autoConnect=false nothing retries on our behalf, so
-                    // drive a fresh cycle ourselves. A reconnect after a real
-                    // disconnect is the sequence that works by hand.
-                    if (wasReady) { cycle = 1 }
+                    setPill("RETRYING", S_ARMING)
+                    if (wasReady) cycle = 1
                     nextCycle()
                 } else {
-                    setState("OFFLINE", "not connected", "#7C8A8C")
+                    setPill("OFFLINE", DIM)
+                    setState("OFFLINE", "not connected", S_OFF)
                 }
             }
         }
@@ -376,32 +578,24 @@ class MainActivity : Activity() {
             val services = g.services
             val ms = System.currentTimeMillis() - discoverStarted
             val how = if (ms < 2000) "CACHE HIT" else "over the air"
-            log("services discovered: status=$status count=${services.size} " +
-                "in ${ms}ms ($how)")
+            log("services: status=$status count=${services.size} in ${ms}ms ($how)")
 
             if (status != BluetoothGatt.GATT_SUCCESS || services.isEmpty()) {
                 if (discoveryTries < MAX_DISCOVERY) {
                     discoveryTries++
-                    // Deliberately NOT refreshing here: repeating it changed
-                    // nothing across four passes, so retry plainly instead.
-                    log("empty table - retrying discovery ($discoveryTries), no refresh")
+                    log("empty table - retrying discovery ($discoveryTries)")
                     ui.postDelayed({ g.discoverServices() }, 1200)
                 } else {
-                    log("empty after $MAX_DISCOVERY tries - starting a fresh connection")
+                    log("empty after $MAX_DISCOVERY tries - fresh connection")
                     nextCycle()
                 }
                 return
             }
 
             val knog = g.getService(KNOG_SVC)
-            if (knog == null) {
-                log("Knog service missing from the table - retrying")
-                nextCycle()
-                return
-            }
+            if (knog == null) { log("Knog service missing - retrying"); nextCycle(); return }
             cpChar = knog.getCharacteristic(CP_CHR)
             alarmChar = knog.getCharacteristic(ALARM_CHR)
-            log("control point + alarm characteristic found")
 
             alarmChar?.let { ac ->
                 enqueue("subscribe alarm") {
@@ -426,43 +620,31 @@ class MainActivity : Activity() {
                 enqueue("read battery") { g.readCharacteristic(bc) }
             }
 
-            ui.post {
-                armBtn.isEnabled = true
-                disarmBtn.isEnabled = true
-            }
+            ui.post { armBtn.isEnabled = true; disarmBtn.isEnabled = true }
+            ui.post { connectBtn.text = "Disconnect" }
+            setPill("READY", S_ON)
             ui.removeCallbacks(keepAlive)
             ui.postDelayed(keepAlive, KEEPALIVE_MS)
-            ui.post { connectBtn.text = "Disconnect" }
-            log("=========================================")
-            log("READY on attempt $cycle - arm/disarm enabled")
-            log("=========================================")
+            log("READY on attempt $cycle")
         }
 
-        @Deprecated("targetSdk 28 uses this signature")
+        @Deprecated("targetSdk uses the legacy signature")
         override fun onCharacteristicRead(
             g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int
-        ) {
-            handleValue(c, c.value, status)
-            opDone()
-        }
+        ) { handleValue(c, c.value, status); opDone() }
 
-        @Deprecated("targetSdk 28 uses this signature")
+        @Deprecated("targetSdk uses the legacy signature")
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
             handleValue(c, c.value, BluetoothGatt.GATT_SUCCESS)
         }
 
         override fun onCharacteristicWrite(
             g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int
-        ) {
-            log("write ${if (status == 0) "ok" else "failed ($status)"}")
-            opDone()
-        }
+        ) { log(if (status == 0) "write ok" else "write failed ($status)"); opDone() }
 
         override fun onDescriptorWrite(
             g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int
-        ) {
-            opDone()
-        }
+        ) { opDone() }
     }
 
     private fun handleValue(c: BluetoothGattCharacteristic, value: ByteArray?, status: Int) {
@@ -471,32 +653,22 @@ class MainActivity : Activity() {
             ALARM_CHR -> {
                 val v = (value.getOrElse(0) { 0 }.toInt() and 0xFF) or
                         ((value.getOrElse(1) { 0 }.toInt() and 0xFF) shl 8)
-                val (word, sub, col) = when (v) {
-                    0 -> Triple("OFF", "disarmed", "#7C8A8C")
-                    1 -> Triple("ARMING", "turning on", "#E0A63C")
-                    2 -> Triple("ARMED", "on watch", "#4FBE7C")
-                    3 -> Triple("RINGING", "siren active", "#F0574A")
-                    else -> Triple("STATE $v", "unrecognised", "#8B9B9D")
+                when (v) {
+                    0 -> setState("OFF", "disarmed", S_OFF)
+                    1 -> setState("ARMING", "turning on", S_ARMING)
+                    2 -> setState("ARMED", "on watch", S_ON)
+                    3 -> setState("RINGING", "siren active", S_RING)
+                    else -> setState("STATE $v", "unrecognised", DIM)
                 }
-                setState(word, sub, col)
             }
-            BATT_CHR -> {
-                val pct = value.getOrElse(0) { 0 }.toInt() and 0xFF
-                ui.post { battView.text = "Battery $pct%" }
-            }
+            BATT_CHR -> renderBattery(value.getOrElse(0) { 0 }.toInt() and 0xFF)
         }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        ui.removeCallbacks(keepAlive)
-        gatt?.close()
     }
 
     private fun writeCp(op: Byte, what: String) {
         val g = gatt; val c = cpChar
         if (g == null || c == null) { log("not ready"); return }
-        log("$what -> control point 0x%02x".format(op))
+        log("$what → control point 0x%02x".format(op))
         enqueue("write $what") {
             c.value = byteArrayOf(op)
             c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT

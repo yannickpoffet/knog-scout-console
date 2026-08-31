@@ -14,8 +14,8 @@ android {
         // so nothing needs the non-SDK interface exemption that targetSdk 28
         // bought - and Play Protect stops blocking the install.
         targetSdk 34
-        versionCode 2
-        versionName "1.1"
+        versionCode 3
+        versionName "1.2"
     }
 
     compileOptions {
